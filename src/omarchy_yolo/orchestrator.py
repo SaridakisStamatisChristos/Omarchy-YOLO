@@ -92,9 +92,9 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             async with self.coordinator.worker_slot():
                 final_summary = await self._finalize(job_id, repo, integration_path)
             job = self.db.get_job(job_id)
-            # Final review is the acceptance boundary. If cancellation arrives while
-            # optional source application is in flight, finish application/refusal,
-            # provenance persistence, and completion together.
+            # Final review is the acceptance boundary. Every fallible provenance
+            # operation completes before optional source application. The protected
+            # step then finishes application/refusal and durable completion together.
             await finish_before_cancel(
                 self._complete_accepted_job(job, repo, final_summary)
             )
@@ -156,6 +156,29 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         final_summary: str,
     ) -> None:
         accepted = self.db.get_job(job.id)
+        final_commit = await asyncio.to_thread(repo.head, Path(accepted.integration_path))
+        dossier_content, dossier_sha256 = await asyncio.to_thread(
+            build_dossier,
+            db=self.db,
+            config=self.config,
+            registry=self.registry,
+            job_id=accepted.id,
+            final_commit=final_commit,
+            final_summary=final_summary,
+            source_apply_intent="requested" if accepted.auto_apply else "not-requested",
+        )
+        self.db.store_dossier(
+            accepted.id,
+            schema_version=DOSSIER_SCHEMA_VERSION,
+            sha256=dossier_sha256,
+            content=dossier_content,
+        )
+        self.db.event(
+            accepted.id,
+            "job.dossier_created",
+            {"sha256": dossier_sha256, "schema_version": DOSSIER_SCHEMA_VERSION},
+        )
+
         source_apply_outcome = "not-requested"
         if accepted.auto_apply:
             try:
@@ -172,29 +195,6 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                 source_apply_outcome = f"skipped: {str(exc)[-1_000:]}"
                 self.db.event(accepted.id, "job.apply_skipped", {"reason": str(exc)})
 
-        final_commit = await asyncio.to_thread(repo.head, Path(accepted.integration_path))
-        dossier_content, dossier_sha256 = await asyncio.to_thread(
-            build_dossier,
-            db=self.db,
-            config=self.config,
-            registry=self.registry,
-            job_id=accepted.id,
-            final_commit=final_commit,
-            final_summary=final_summary,
-            source_apply_outcome=source_apply_outcome,
-        )
-        self.db.store_dossier(
-            accepted.id,
-            schema_version=DOSSIER_SCHEMA_VERSION,
-            sha256=dossier_sha256,
-            content=dossier_content,
-        )
-        self.db.event(
-            accepted.id,
-            "job.dossier_created",
-            {"sha256": dossier_sha256, "schema_version": DOSSIER_SCHEMA_VERSION},
-        )
-
         self.db.update_job(
             accepted.id,
             state=JobState.COMPLETED,
@@ -209,6 +209,7 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                 "summary": final_summary,
                 "branch": accepted.integration_branch,
                 "dossier_sha256": dossier_sha256,
+                "source_apply_outcome": source_apply_outcome,
             },
         )
         notify(
