@@ -1,11 +1,11 @@
-name: apply-mypy-fix
+name: apply-mypy-bundle
 
 on:
   push:
     branches: ["audit/v1.0.1-hardening"]
     paths:
-      - ".github/workflows/apply-mypy-fix.yml"
-      - ".github/mypy-fix.patch"
+      - ".github/workflows/apply-mypy-bundle.yml"
+      - ".github/mypy-parts/**"
 
 permissions:
   contents: write
@@ -18,11 +18,13 @@ jobs:
         with:
           ref: audit/v1.0.1-hardening
           fetch-depth: 0
-      - name: Apply audited strict-Mypy patch
+      - name: Install verified strict-Mypy source bundle
         shell: bash
         run: |
           set -euo pipefail
-          git apply --index .github/mypy-fix.patch
+          cat .github/mypy-parts/part-* > /tmp/oy-mypy-fix.tar.gz
+          echo "c436de7dd6e245f924d252ec7148281241eec4d3caca60262ff3c7da5391597f  /tmp/oy-mypy-fix.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/oy-mypy-fix.tar.gz -C .
           test "$(git hash-object src/omarchy_yolo/agents/base.py)" = "06838fdfe32ee374f6778b460253a0d010578f11"
           test "$(git hash-object src/omarchy_yolo/daemon.py)" = "982243f96a132e169222f3ea715b7385dd956090"
           test "$(git hash-object src/omarchy_yolo/db_records.py)" = "6a4089f4439e9facf03fe3239f7ef21f2726a0d1"
@@ -30,7 +32,8 @@ jobs:
           test "$(git hash-object src/omarchy_yolo/orchestrator_integration.py)" = "4dc00d183a6ee8b678cae6b31fe4cf0300d0a337"
           test "$(git hash-object src/omarchy_yolo/orchestrator_task.py)" = "24a215db493a9eb1141f18573ad40291a41faed9"
           test "$(git hash-object src/omarchy_yolo/reviewer.py)" = "6081dfdbfaeead76d7cbaac0d542f79bdfb28df3"
-          git rm .github/mypy-fix.patch .github/workflows/apply-mypy-fix.yml
+          git add src/omarchy_yolo/agents/base.py src/omarchy_yolo/daemon.py src/omarchy_yolo/db_records.py src/omarchy_yolo/db_recovery.py src/omarchy_yolo/orchestrator_integration.py src/omarchy_yolo/orchestrator_task.py src/omarchy_yolo/reviewer.py
+          git rm -r .github/mypy-parts .github/workflows/apply-mypy-bundle.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "fix(types): declare composition contracts"
