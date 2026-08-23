@@ -153,6 +153,7 @@ async def test_finalize_repairs_failed_gate_then_passes(
         git_repo, tmp_path, engine=engine
     )
     orchestrator = Orchestrator(config, db)
+    monkeypatch.setattr(orchestrator.registry, "choose_role", lambda *args, **kwargs: "semantic")
     calls = 0
     repairs = 0
 
@@ -189,6 +190,7 @@ async def test_finalize_repairs_audit_retry_then_passes(
         git_repo, tmp_path, engine=engine
     )
     orchestrator = Orchestrator(config, db)
+    monkeypatch.setattr(orchestrator.registry, "choose_role", lambda *args, **kwargs: "semantic")
     review_calls = 0
     repair_issues: list[str] = []
 
@@ -265,6 +267,7 @@ async def test_finalize_refuses_unrepairable_final_gate(
         git_repo, tmp_path, engine=engine
     )
     orchestrator = Orchestrator(config, db)
+    monkeypatch.setattr(orchestrator.registry, "choose_role", lambda *args, **kwargs: "semantic")
 
     async def bad_gates(*_: Any, **__: Any) -> list[GateResult]:
         return [GateResult("false", 1, "", "still broken", 0.01, False)]
