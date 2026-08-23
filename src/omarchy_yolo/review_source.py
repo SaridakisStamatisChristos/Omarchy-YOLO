@@ -22,7 +22,7 @@ class ReviewChunk:
     text: str
 
 
-def _git_text(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> str:
+def _git_bytes(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> bytes:
     repo.assert_worktree(cwd)
     argv = [
         "git",
@@ -71,17 +71,28 @@ def _git_text(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> str:
         raise YoloError(
             f"Git review query failed with exit {proc.returncode}: {' '.join(args[:4])}"
         )
-    return data.decode("utf-8", errors="replace")
+    return data
+
+
+def _git_text(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> str:
+    return _git_bytes(repo, cwd, args, max_bytes).decode("utf-8", errors="replace")
+
+
+def _display_path(path: str) -> str:
+    """Make an arbitrary POSIX filename safe for UTF-8 prompts without losing identity."""
+    return path.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
 def changed_files(repo: GitRepo, cwd: Path, base: str, *, max_files: int) -> list[str]:
-    raw = _git_text(
+    raw = _git_bytes(
         repo,
         cwd,
         ["diff", "--name-only", "-z", f"{base}..HEAD"],
         MAX_CHANGED_FILE_LIST_BYTES,
     )
-    files = [item for item in raw.split("\0") if item]
+    # os.fsdecode uses the platform's surrogateescape strategy on Linux, allowing the
+    # resulting str to be passed back to subprocess and recover the original path bytes.
+    files = [os.fsdecode(item) for item in raw.split(b"\0") if item]
     if len(files) > max_files:
         raise YoloError(
             f"candidate changes {len(files)} files; configured final-review maximum is {max_files}"
@@ -156,10 +167,11 @@ def build_review_chunks(
     chunk_bytes: int,
     chunk_files: int,
 ) -> tuple[list[str], list[ReviewChunk]]:
-    files = changed_files(repo, cwd, base, max_files=max_files)
-    if not files:
+    actual_files = changed_files(repo, cwd, base, max_files=max_files)
+    if not actual_files:
         return [], [ReviewChunk(index=1, files=(), text="No changed files.")]
 
+    manifest = [_display_path(path) for path in actual_files]
     chunks: list[ReviewChunk] = []
     current_parts: list[str] = []
     current_files: list[str] = []
@@ -181,7 +193,8 @@ def build_review_chunks(
         current_files = []
         current_bytes = 0
 
-    for path in files:
+    for path in actual_files:
+        display_path = _display_path(path)
         diff = _file_diff(repo, cwd, base, path)
         diff_bytes = len(diff.encode("utf-8"))
         total_bytes += diff_bytes
@@ -190,27 +203,34 @@ def build_review_chunks(
                 "candidate diff exceeds the 32 MB hierarchical-review safety ceiling; "
                 "split the release into smaller changes"
             )
-        header_probe = f"\n===== FILE {path} PART 999999/999999 =====\n"
+        header_probe = f"\n===== FILE {display_path} PART 999999/999999 =====\n"
         payload_budget = chunk_bytes - len(header_probe.encode("utf-8"))
         if payload_budget < 1024:
-            raise YoloError(f"review chunk budget is too small for file path {path!r}")
-        pieces = _split_text(diff or f"[No textual diff for {path}]\n", payload_budget)
+            raise YoloError(f"review chunk budget is too small for file path {display_path!r}")
+        pieces = _split_text(
+            diff or f"[No textual diff for {display_path}]\n",
+            payload_budget,
+        )
         for part_number, piece in enumerate(pieces, start=1):
-            header = f"\n===== FILE {path} PART {part_number}/{len(pieces)} =====\n"
+            header = (
+                f"\n===== FILE {display_path} PART {part_number}/{len(pieces)} =====\n"
+            )
             payload = header + piece
             payload_bytes = len(payload.encode("utf-8"))
             if (
                 current_parts
                 and (
                     current_bytes + payload_bytes > chunk_bytes
-                    or len(set(current_files + [path])) > chunk_files
+                    or len(set(current_files + [display_path])) > chunk_files
                 )
             ):
                 flush()
             if payload_bytes > chunk_bytes:
-                raise YoloError(f"review chunk construction exceeded byte limit for {path}")
+                raise YoloError(
+                    f"review chunk construction exceeded byte limit for {display_path}"
+                )
             current_parts.append(payload)
-            current_files.append(path)
+            current_files.append(display_path)
             current_bytes += payload_bytes
     flush()
-    return files, chunks
+    return manifest, chunks
