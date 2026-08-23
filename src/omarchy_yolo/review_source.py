@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import os
-import signal
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,59 +18,25 @@ class ReviewChunk:
     text: str
 
 
-def _git_bytes(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> bytes:
+def _git_text(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> str:
     repo.assert_worktree(cwd)
-    argv = [
-        "git",
-        "-C",
-        str(cwd),
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "diff.external=",
-        *args,
-    ]
-    env = os.environ.copy()
-    env.setdefault("GIT_PAGER", "cat")
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        start_new_session=True,
-    )
-    stdout, stderr = proc.communicate()
-    if proc.returncode != 0:
-        message = stderr[-4_000:].decode("utf-8", errors="replace")
-        raise YoloError(f"Git review query failed: {message}")
-    if len(stdout) > max_bytes:
+    text, truncated = repo._run_stdout_bounded(args, cwd=cwd, max_bytes=max_bytes)
+    if truncated:
         raise YoloError(
             f"candidate review data exceeds the safety ceiling ({max_bytes} bytes); "
-            "split the change into smaller tasks or raise the reviewed design limit"
+            "split the change into smaller tasks"
         )
-    return stdout
-
-
-def _terminate_if_needed(proc: subprocess.Popen[bytes]) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    return text
 
 
 def changed_files(repo: GitRepo, cwd: Path, base: str, *, max_files: int) -> list[str]:
-    raw = _git_bytes(
+    raw = _git_text(
         repo,
         cwd,
         ["diff", "--name-only", "-z", f"{base}..HEAD"],
         MAX_CHANGED_FILE_LIST_BYTES,
     )
-    files = [item.decode("utf-8", errors="replace") for item in raw.split(b"\0") if item]
+    files = [item for item in raw.split("\0") if item]
     if len(files) > max_files:
         raise YoloError(
             f"candidate changes {len(files)} files; configured final-review maximum is {max_files}"
@@ -82,7 +45,7 @@ def changed_files(repo: GitRepo, cwd: Path, base: str, *, max_files: int) -> lis
 
 
 def _file_diff(repo: GitRepo, cwd: Path, base: str, path: str) -> str:
-    raw = _git_bytes(
+    return _git_text(
         repo,
         cwd,
         [
@@ -97,7 +60,6 @@ def _file_diff(repo: GitRepo, cwd: Path, base: str, path: str) -> str:
         ],
         MAX_SINGLE_FILE_DIFF_BYTES,
     )
-    return raw.decode("utf-8", errors="replace")
 
 
 def _split_text(text: str, max_bytes: int) -> list[str]:
