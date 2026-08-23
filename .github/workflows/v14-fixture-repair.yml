@@ -1,0 +1,93 @@
+name: v14-fixture-repair
+
+on:
+  push:
+    branches: [feature/v1.4-formal-reliability]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feature/v1.4-formal-reliability
+      - name: Repair legal-state fixture edits and self-remove
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('tests/test_integration_semantics_v12.py')
+          text = p.read_text()
+          old = 'from omarchy_yolo.model import GateResult, PlannedTask, ReviewResult\n'
+          new = 'from omarchy_yolo.model import GateResult, PlannedTask, ReviewResult, TaskState\n'
+          if text.count(old) != 1:
+              raise SystemExit('integration semantics import anchor mismatch')
+          p.write_text(text.replace(old, new, 1))
+
+          p = Path('tests/test_resilience_v13.py')
+          text = p.read_text()
+          old = '''            task_state = active_states[index % len(active_states)]
+            db.update_job(job.id, state=job_state, stop_requested=stop_requested)
+            db.update_task(inflight.id, state=task_state, attempts=1)
+            db.update_task(completed.id, state=TaskState.RUNNING)
+        db.update_task(completed.id, state=TaskState.REVIEWING)
+        db.update_task(completed.id, state=TaskState.INTEGRATING)
+        db.update_task(completed.id, state=TaskState.COMPLETED)
+            db.start_attempt(
+                job_id=job.id,
+                task_id=inflight.id,
+                number=1,
+                agent="fault-injected",
+                worktree="/tmp/worktree",
+                branch="yolo/task",
+                log_path="/tmp/attempt.log",
+            )
+            cases.append((job.id, not stop_requested and job_state != JobState.STOPPING))
+            if not stop_requested and job_state != JobState.STOPPING:
+                expected_requeued.add(job.id)
+'''
+          new = '''            task_state = active_states[index % len(active_states)]
+            db.update_job(job.id, state=job_state, stop_requested=stop_requested)
+            if task_state == TaskState.RUNNING:
+                db.update_task(inflight.id, state=TaskState.RUNNING, attempts=1)
+            elif task_state == TaskState.REVIEWING:
+                db.update_task(inflight.id, state=TaskState.RUNNING, attempts=1)
+                db.update_task(inflight.id, state=TaskState.REVIEWING)
+            else:
+                db.update_task(inflight.id, state=TaskState.RUNNING, attempts=1)
+                db.update_task(inflight.id, state=TaskState.REVIEWING)
+                db.update_task(inflight.id, state=TaskState.INTEGRATING)
+            db.update_task(completed.id, state=TaskState.RUNNING)
+            db.update_task(completed.id, state=TaskState.REVIEWING)
+            db.update_task(completed.id, state=TaskState.INTEGRATING)
+            db.update_task(completed.id, state=TaskState.COMPLETED)
+            db.start_attempt(
+                job_id=job.id,
+                task_id=inflight.id,
+                number=1,
+                agent="fault-injected",
+                worktree="/tmp/worktree",
+                branch="yolo/task",
+                log_path="/tmp/attempt.log",
+            )
+            cases.append((job.id, not stop_requested and job_state != JobState.STOPPING))
+            if not stop_requested and job_state != JobState.STOPPING:
+                expected_requeued.add(job.id)
+'''
+          if text.count(old) != 1:
+              raise SystemExit('resilience recovery fixture anchor mismatch')
+          p.write_text(text.replace(old, new, 1))
+
+          Path('.github/workflows/v14-fixture-repair.yml').unlink()
+          PY
+          python -m compileall -q tests
+          git config user.name 'Omarchy YOLO CI'
+          git config user.email 'omarchy-yolo@localhost'
+          git add tests/test_integration_semantics_v12.py tests/test_resilience_v13.py .github/workflows/v14-fixture-repair.yml
+          git diff --cached --check
+          git commit -m 'test: repair v1.4 legal-state fixtures'
+          git push origin HEAD:feature/v1.4-formal-reliability
