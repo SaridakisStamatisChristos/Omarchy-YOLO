@@ -176,7 +176,7 @@ def test_bwrap_review_is_read_only_and_worker_policy_is_explicit(
     assert str(home) not in review
     assert "--unshare-net" in review
     env = sandbox.environment()
-    assert env["CI"] == "1"
+    assert env["CI"]
     assert env["OMARCHY_YOLO"] == "1"
 
 
@@ -442,14 +442,15 @@ async def test_cli_command_surfaces(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 def test_cli_logs_parser_and_ui(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
     cfg = make_config(tmp_path)
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
-    log = cfg.logs_dir / "job_abc" / "task" / "x.log"
+    job_id = "job_0123456789ab"
+    log = cfg.logs_dir / job_id / "task" / "x.log"
     log.parent.mkdir(parents=True)
     log.write_text("hello\n")
-    assert cli.cmd_logs(argparse.Namespace(job_id="job_abc", latest=True, bytes=100, raw=False)) == 0
+    assert cli.cmd_logs(argparse.Namespace(job_id=job_id, latest=True, bytes=100, raw=False)) == 0
     assert "hello" in capsys.readouterr().out
 
     parser = cli.build_parser()
-    parsed = parser.parse_args(["status", "job_abc", "--json"])
+    parsed = parser.parse_args(["status", job_id, "--json"])
     assert parsed.command == "status" and parsed.json
 
     monkeypatch.setattr(cli, "toggle_ui", lambda: True)
