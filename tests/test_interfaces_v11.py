@@ -219,7 +219,7 @@ async def test_agent_run_enforces_policy_and_prompt_bound(tmp_path: Path) -> Non
     runner = CapturingRunner(stdout='{"text":"answer"}\n')
     agent = CommandAgent(
         "opencode",
-        AgentConfig(command=("python",)),
+        AgentConfig(command=("python",), review_command=("python",)),
         make_config(tmp_path),
         runner=runner,
     )
