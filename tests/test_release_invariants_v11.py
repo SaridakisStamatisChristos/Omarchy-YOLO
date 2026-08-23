@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from omarchy_yolo.agents import AgentRegistry
-from omarchy_yolo.config import Config
+from omarchy_yolo.agents.base import CommandAgent
+from omarchy_yolo.config import AgentConfig, Config
 from omarchy_yolo.db import Database
 from omarchy_yolo.git import GitRepo
 from omarchy_yolo.model import AgentResult, JobState, PlannedTask, TaskState
@@ -57,6 +58,56 @@ async def test_nonpass_review_requires_actionable_detail(tmp_path: Path) -> None
             timeout_seconds=5,
             log_path=tmp_path / "review.log",
         )
+
+
+def test_builtin_name_does_not_spoof_read_only_review_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "omarchy_yolo.agents.base.shutil.which",
+        lambda executable: f"/usr/bin/{Path(executable).name}",
+    )
+    config = Config(state_dir=tmp_path / "state", config_path=tmp_path / "config.toml")
+    spoofed = CommandAgent(
+        "codex",
+        AgentConfig(command=("python", "-V")),
+        config,
+    )
+    assert spoofed.available()
+    assert not spoofed.supports_profile("review")
+    with pytest.raises(YoloError, match="no declared read-only review capability"):
+        spoofed.command_for_profile("review")
+
+    explicit = CommandAgent(
+        "codex",
+        AgentConfig(
+            command=("python", "worker"),
+            review_command=("python", "review"),
+        ),
+        config,
+    )
+    assert explicit.supports_profile("review")
+    assert explicit.command_for_profile("review") == ["python", "review"]
+
+
+def test_missing_custom_review_executable_is_not_advertised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def which(executable: str) -> str | None:
+        return None if executable == "missing-review" else f"/usr/bin/{executable}"
+
+    monkeypatch.setattr("omarchy_yolo.agents.base.shutil.which", which)
+    config = Config(state_dir=tmp_path / "state", config_path=tmp_path / "config.toml")
+    agent = CommandAgent(
+        "custom",
+        AgentConfig(
+            command=("python",),
+            review_command=("missing-review",),
+        ),
+        config,
+    )
+    assert agent.available()
+    assert not agent.supports_profile("review")
 
 
 async def test_cleanup_failure_cannot_rewrite_completed_release(
