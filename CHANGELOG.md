@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 - 2026-08-23
+
+- Make gate execution fail closed on durable-log/storage errors: mid-stream failures terminate the gate process group and propagate instead of being discarded.
+- Treat task worktree cleanup as post-integration housekeeping: cleanup failure emits `task.cleanup_failed` without rewriting a task/job that already integrated successfully.
+- Add a dedicated Bubblewrap gate profile with writable repository cwd, read-only host filesystem/HOME, and network policy inherited from sandbox configuration.
+- Upgrade final audit from shard-only synthesis to a three-level semantic hierarchy: file-local shards, per-file semantic synthesis for multi-shard files, then global cross-file synthesis.
+- Reject binary changes by default because semantic content cannot be inspected; `engine.final_review_allow_binary = true` explicitly opts into metadata-only binary review.
+- Require meaningful semantic summaries on reviewer `pass` results while preserving the v1.1 synthesis-call compatibility path.
+- Add failure-injection and trust-boundary tests for ENOSPC gate logs, process termination, cleanup failure, binary diffs, hostile filenames, gate sandboxing, semantic synthesis, integration rollback, DB symlink refusal, and cancelled resource waiters.
+- Raise aggregate branch coverage enforcement from 70% to 75% and add module-specific floors for Git, gates/process, DB, runtime/sandbox, orchestration, and review code.
+- Increase measured branch coverage to more than 76%; critical paths including Git, gates, process handling and integration state transitions receive materially stronger direct coverage.
+- Verify the built wheel by installing and executing it in a clean virtual environment on both Python 3.12 and 3.13.
+- Pin the CI/development dependency artifacts by SHA-256 and install them with `pip --require-hashes`.
+- Make package `__version__` the canonical runtime version used by CLI and daemon RPC; release version is `1.2.0`.
+- Expand the opt-in live smoke into a disposable end-to-end agent transaction through daemon, RPC, planning, implementation, review, finalization and integration-branch verification; ping Omarchy Shell when available.
+
 ## 1.1.0 - 2026-08-23
 
 - Add a daemon-wide worker semaphore so multiple jobs share one global execution budget instead of multiplying `max_parallel` per job.
