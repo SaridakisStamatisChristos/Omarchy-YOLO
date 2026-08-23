@@ -28,6 +28,15 @@ jobs:
           python -m pip install -r requirements-dev.lock
           python -m pip install -e . --no-build-isolation --no-deps
           python -m pip check
+      - name: Audit resolved dependency artifact hashes
+        run: |
+          rm -rf /tmp/omarchy-yolo-hash-wheels
+          mkdir -p /tmp/omarchy-yolo-hash-wheels
+          python -m pip download --no-deps -r requirements-dev.lock -d /tmp/omarchy-yolo-hash-wheels >/dev/null
+          for artifact in /tmp/omarchy-yolo-hash-wheels/*; do
+            echo "HASHFILE $(basename "$artifact")"
+            python -m pip hash "$artifact"
+          done
       - name: Ruff
         run: python -m ruff check src tests
       - name: Mypy
