@@ -136,18 +136,33 @@ class Reviewer:
         goal: str,
         gates: list[GateResult],
         manifest: list[str],
-        file_reviews: list[tuple[str, ReviewResult]],
         cwd: Path,
         agent_name: str,
         timeout_seconds: int,
         log_path: Path,
+        file_reviews: list[tuple[str, ReviewResult]] | None = None,
+        chunk_reviews: list[ReviewResult] | None = None,
     ) -> ReviewResult:
         manifest_text = "\n".join(f"- {path}" for path in manifest) or "- no changed files"
-        summary_text = "\n".join(
-            f"- {path}: {review.summary}" for path, review in file_reviews
-        ) or "- no changed-file reports"
         if len(manifest_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
             raise YoloError("changed-file manifest is too large for complete synthesis review")
+
+        # Backward compatibility for v1.1 callers. The orchestrator itself never uses
+        # this path in v1.2; it supplies semantically synthesized file reports.
+        effective_file_reviews = file_reviews
+        if effective_file_reviews is None:
+            legacy = chunk_reviews or []
+            if len(legacy) == len(manifest):
+                effective_file_reviews = list(zip(manifest, legacy, strict=True))
+            else:
+                effective_file_reviews = [
+                    (f"legacy-shard-{index}", review)
+                    for index, review in enumerate(legacy, start=1)
+                ]
+
+        summary_text = "\n".join(
+            f"- {path}: {review.summary}" for path, review in effective_file_reviews
+        ) or "- no changed-file reports"
         if len(summary_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
             raise YoloError("file semantic reports are too large for complete synthesis review")
         prompt = FINAL_SYNTHESIS_TEMPLATE.format(
