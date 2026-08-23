@@ -251,6 +251,28 @@ class IntegrationMixin:
         )
         return list(results)
 
+    @staticmethod
+    def _review_failure(
+        *,
+        summary: str,
+        entries: list[tuple[str, ReviewResult]],
+    ) -> ReviewResult | None:
+        findings: list[str] = []
+        saw_fail = False
+        for label, review in entries:
+            if review.passed:
+                continue
+            saw_fail = saw_fail or review.verdict == "fail"
+            for finding in review.findings or (review.summary,):
+                if finding:
+                    findings.append(f"{label}: {finding}")
+        if not findings:
+            return None
+        bounded = findings[:64]
+        if len(findings) > len(bounded):
+            bounded.append(f"{len(findings) - len(bounded)} additional findings omitted")
+        return ReviewResult("fail" if saw_fail else "retry", summary, tuple(bounded))
+
     async def _hierarchical_final_review(
         self,
         job_id: str,
@@ -269,6 +291,7 @@ class IntegrationMixin:
             max_files=self.config.engine.final_review_max_files,
             chunk_bytes=self.config.engine.final_review_chunk_bytes,
             chunk_files=self.config.engine.final_review_chunk_files,
+            allow_binary=self.config.engine.final_review_allow_binary,
         )
         self.db.event(
             job_id,
@@ -276,9 +299,8 @@ class IntegrationMixin:
             {"cycle": cycle, "files": len(manifest), "chunks": len(chunks)},
         )
 
-        chunk_reviews: list[ReviewResult] = []
-        material_findings: list[str] = []
-        saw_fail = False
+        chunk_reviews_by_file: dict[str, list[ReviewResult]] = {path: [] for path in manifest}
+        chunk_results: list[tuple[str, ReviewResult]] = []
         for chunk in chunks:
             log_path = (
                 self.config.logs_dir
@@ -298,7 +320,6 @@ class IntegrationMixin:
                 timeout_seconds=self.config.engine.agent_timeout_seconds,
                 log_path=log_path,
             )
-            chunk_reviews.append(review)
             self.db.event(
                 job_id,
                 "final.review_chunk",
@@ -312,23 +333,73 @@ class IntegrationMixin:
                     "findings": list(review.findings),
                 },
             )
-            if not review.passed:
-                saw_fail = saw_fail or review.verdict == "fail"
-                for finding in review.findings or (review.summary,):
-                    if finding:
-                        material_findings.append(f"chunk {chunk.index}: {finding}")
+            label = f"chunk {chunk.index}"
+            chunk_results.append((label, review))
+            for file_path in chunk.files:
+                if file_path not in chunk_reviews_by_file:
+                    raise YoloError(
+                        f"final-review shard referenced a file outside the manifest: {file_path}"
+                    )
+                chunk_reviews_by_file[file_path].append(review)
 
-        if material_findings:
-            bounded = material_findings[:64]
-            if len(material_findings) > len(bounded):
-                bounded.append(
-                    f"{len(material_findings) - len(bounded)} additional shard findings omitted"
+        shard_failure = self._review_failure(
+            summary="hierarchical shard audit found material defects",
+            entries=chunk_results,
+        )
+        if shard_failure is not None:
+            return shard_failure
+
+        file_reviews: list[tuple[str, ReviewResult]] = []
+        for file_path in manifest:
+            reviews = chunk_reviews_by_file.get(file_path, [])
+            if not reviews:
+                return ReviewResult(
+                    "fail",
+                    "hierarchical review lost changed-file coverage",
+                    (f"no reviewed shard represented {file_path}",),
                 )
-            return ReviewResult(
-                "fail" if saw_fail else "retry",
-                "hierarchical shard audit found material defects",
-                tuple(bounded),
+            if len(reviews) == 1:
+                file_review = reviews[0]
+                synthesized = False
+            else:
+                synthesis_log = (
+                    self.config.logs_dir
+                    / job_id
+                    / "final"
+                    / f"review-{cycle}-file-{len(file_reviews) + 1}-{reviewer_name}.log"
+                )
+                file_review = await self.reviewer.review_file_synthesis(
+                    goal=job.goal,
+                    gates=gates,
+                    file_path=file_path,
+                    chunk_reviews=reviews,
+                    cwd=integration_path,
+                    agent_name=reviewer_name,
+                    timeout_seconds=self.config.engine.agent_timeout_seconds,
+                    log_path=synthesis_log,
+                )
+                synthesized = True
+            file_reviews.append((file_path, file_review))
+            self.db.event(
+                job_id,
+                "final.review_file",
+                {
+                    "cycle": cycle,
+                    "file": file_path,
+                    "shards": len(reviews),
+                    "synthesized": synthesized,
+                    "verdict": file_review.verdict,
+                    "summary": file_review.summary,
+                    "findings": list(file_review.findings),
+                },
             )
+
+        file_failure = self._review_failure(
+            summary="file-level semantic synthesis found material defects",
+            entries=file_reviews,
+        )
+        if file_failure is not None:
+            return file_failure
 
         synthesis_log = (
             self.config.logs_dir
@@ -340,7 +411,7 @@ class IntegrationMixin:
             goal=job.goal,
             gates=gates,
             manifest=manifest,
-            chunk_reviews=chunk_reviews,
+            file_reviews=file_reviews,
             cwd=integration_path,
             agent_name=reviewer_name,
             timeout_seconds=self.config.engine.agent_timeout_seconds,

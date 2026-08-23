@@ -267,9 +267,19 @@ class TaskExecutionMixin:
                 task_id=task_id,
             )
             if self.config.engine.cleanup_worktrees:
-                async with self.coordinator.repo_lock(repo.root):
-                    await asyncio.to_thread(repo.remove_worktree, worktree, force=True)
-                    await asyncio.to_thread(repo.delete_branch, branch)
+                try:
+                    async with self.coordinator.repo_lock(repo.root):
+                        await asyncio.to_thread(repo.remove_worktree, worktree, force=True)
+                        await asyncio.to_thread(repo.delete_branch, branch)
+                except Exception as exc:
+                    # Integration success is durable correctness; worktree deletion is
+                    # housekeeping and must never retroactively fail an accepted task.
+                    self.db.event(
+                        job_id,
+                        "task.cleanup_failed",
+                        {"error": str(exc)[-4_000:], "branch": branch, "path": str(worktree)},
+                        task_id=task_id,
+                    )
             return True
 
         task = self.db.get_task(task_id)

@@ -4,7 +4,12 @@ from pathlib import Path
 
 from .agents import AgentRegistry
 from .model import GateResult, ReviewResult, TaskRecord
-from .prompts import FINAL_REVIEW_TEMPLATE, FINAL_SYNTHESIS_TEMPLATE, REVIEW_TEMPLATE
+from .prompts import (
+    FILE_SYNTHESIS_TEMPLATE,
+    FINAL_REVIEW_TEMPLATE,
+    FINAL_SYNTHESIS_TEMPLATE,
+    REVIEW_TEMPLATE,
+)
 from .util import YoloError, extract_json_object, truncate_utf8
 
 MAX_REVIEW_SUMMARY_CHARS = 8_000
@@ -97,32 +102,74 @@ class Reviewer:
         )
         return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
 
-    async def review_final_synthesis(
+    async def review_file_synthesis(
         self,
         *,
         goal: str,
         gates: list[GateResult],
-        manifest: list[str],
+        file_path: str,
         chunk_reviews: list[ReviewResult],
         cwd: Path,
         agent_name: str,
         timeout_seconds: int,
         log_path: Path,
     ) -> ReviewResult:
-        manifest_text = "\n".join(f"- {path}" for path in manifest) or "- no changed files"
         summary_text = "\n".join(
-            f"- chunk {index}: {review.summary or 'passed'}"
+            f"- shard {index}: {review.summary}"
             for index, review in enumerate(chunk_reviews, start=1)
         )
+        if len(file_path.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
+            raise YoloError("file path is too large for complete file synthesis review")
+        if len(summary_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
+            raise YoloError("file shard summaries are too large for complete synthesis review")
+        prompt = FILE_SYNTHESIS_TEMPLATE.format(
+            goal=goal,
+            gates=format_gates(gates),
+            file_path=file_path,
+            chunk_summaries=summary_text or "- no shard summaries",
+        )
+        return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
+
+    async def review_final_synthesis(
+        self,
+        *,
+        goal: str,
+        gates: list[GateResult],
+        manifest: list[str],
+        cwd: Path,
+        agent_name: str,
+        timeout_seconds: int,
+        log_path: Path,
+        file_reviews: list[tuple[str, ReviewResult]] | None = None,
+        chunk_reviews: list[ReviewResult] | None = None,
+    ) -> ReviewResult:
+        manifest_text = "\n".join(f"- {path}" for path in manifest) or "- no changed files"
         if len(manifest_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
             raise YoloError("changed-file manifest is too large for complete synthesis review")
+
+        # Backward compatibility for v1.1 callers. The orchestrator itself never uses
+        # this path in v1.2; it supplies semantically synthesized file reports.
+        effective_file_reviews = file_reviews
+        if effective_file_reviews is None:
+            legacy = chunk_reviews or []
+            if len(legacy) == len(manifest):
+                effective_file_reviews = list(zip(manifest, legacy, strict=True))
+            else:
+                effective_file_reviews = [
+                    (f"legacy-shard-{index}", review)
+                    for index, review in enumerate(legacy, start=1)
+                ]
+
+        summary_text = "\n".join(
+            f"- {path}: {review.summary}" for path, review in effective_file_reviews
+        ) or "- no changed-file reports"
         if len(summary_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
-            raise YoloError("chunk summaries are too large for complete synthesis review")
+            raise YoloError("file semantic reports are too large for complete synthesis review")
         prompt = FINAL_SYNTHESIS_TEMPLATE.format(
             goal=goal,
             gates=format_gates(gates),
             manifest=manifest_text,
-            chunk_summaries=summary_text,
+            file_summaries=summary_text,
         )
         return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
 
@@ -169,8 +216,11 @@ class Reviewer:
             if len(finding) > MAX_REVIEW_FINDING_CHARS:
                 raise YoloError("reviewer finding is too large")
             findings.append(finding)
-        if verdict == "pass" and findings:
-            raise YoloError("reviewer returned pass with material findings")
-        if verdict != "pass" and not summary and not any(findings):
+        if verdict == "pass":
+            if findings:
+                raise YoloError("reviewer returned pass with material findings")
+            if not summary:
+                raise YoloError("reviewer pass verdict must include a semantic summary")
+        elif not summary and not any(findings):
             raise YoloError("reviewer non-pass verdict must include a summary or finding")
         return ReviewResult(verdict, summary, tuple(findings))

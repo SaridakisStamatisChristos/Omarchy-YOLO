@@ -29,6 +29,7 @@ class EngineConfig:
     final_review_chunk_bytes: int = 60_000
     final_review_chunk_files: int = 8
     final_review_max_files: int = 512
+    final_review_allow_binary: bool = False
 
 
 @dataclass(slots=True)
@@ -224,6 +225,11 @@ def load_config(path: Path | None = None) -> Config:
             minimum=1,
             maximum=4096,
             name="engine.final_review_max_files",
+        ),
+        final_review_allow_binary=_strict_bool(
+            e.get("final_review_allow_binary"),
+            default=False,
+            name="engine.final_review_allow_binary",
         ),
     )
 
