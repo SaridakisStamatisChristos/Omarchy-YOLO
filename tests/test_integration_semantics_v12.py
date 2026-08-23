@@ -8,7 +8,7 @@ import pytest
 from omarchy_yolo.config import Config, EngineConfig, GateConfig, GitConfig
 from omarchy_yolo.db import Database
 from omarchy_yolo.git import GitRepo
-from omarchy_yolo.model import GateResult, PlannedTask, ReviewResult
+from omarchy_yolo.model import GateResult, PlannedTask, ReviewResult, TaskState
 from omarchy_yolo.orchestrator import Orchestrator
 from omarchy_yolo.review_source import ReviewChunk
 from omarchy_yolo.util import YoloError
