@@ -4,7 +4,12 @@ from pathlib import Path
 
 from .agents import AgentRegistry
 from .model import GateResult, ReviewResult, TaskRecord
-from .prompts import FINAL_REVIEW_TEMPLATE, FINAL_SYNTHESIS_TEMPLATE, REVIEW_TEMPLATE
+from .prompts import (
+    FILE_SYNTHESIS_TEMPLATE,
+    FINAL_REVIEW_TEMPLATE,
+    FINAL_SYNTHESIS_TEMPLATE,
+    REVIEW_TEMPLATE,
+)
 from .util import YoloError, extract_json_object, truncate_utf8
 
 MAX_REVIEW_SUMMARY_CHARS = 8_000
@@ -97,13 +102,41 @@ class Reviewer:
         )
         return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
 
+    async def review_file_synthesis(
+        self,
+        *,
+        goal: str,
+        gates: list[GateResult],
+        file_path: str,
+        chunk_reviews: list[ReviewResult],
+        cwd: Path,
+        agent_name: str,
+        timeout_seconds: int,
+        log_path: Path,
+    ) -> ReviewResult:
+        summary_text = "\n".join(
+            f"- shard {index}: {review.summary}"
+            for index, review in enumerate(chunk_reviews, start=1)
+        )
+        if len(file_path.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
+            raise YoloError("file path is too large for complete file synthesis review")
+        if len(summary_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
+            raise YoloError("file shard summaries are too large for complete synthesis review")
+        prompt = FILE_SYNTHESIS_TEMPLATE.format(
+            goal=goal,
+            gates=format_gates(gates),
+            file_path=file_path,
+            chunk_summaries=summary_text or "- no shard summaries",
+        )
+        return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
+
     async def review_final_synthesis(
         self,
         *,
         goal: str,
         gates: list[GateResult],
         manifest: list[str],
-        chunk_reviews: list[ReviewResult],
+        file_reviews: list[tuple[str, ReviewResult]],
         cwd: Path,
         agent_name: str,
         timeout_seconds: int,
@@ -111,18 +144,17 @@ class Reviewer:
     ) -> ReviewResult:
         manifest_text = "\n".join(f"- {path}" for path in manifest) or "- no changed files"
         summary_text = "\n".join(
-            f"- chunk {index}: {review.summary or 'passed'}"
-            for index, review in enumerate(chunk_reviews, start=1)
-        )
+            f"- {path}: {review.summary}" for path, review in file_reviews
+        ) or "- no changed-file reports"
         if len(manifest_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
             raise YoloError("changed-file manifest is too large for complete synthesis review")
         if len(summary_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
-            raise YoloError("chunk summaries are too large for complete synthesis review")
+            raise YoloError("file semantic reports are too large for complete synthesis review")
         prompt = FINAL_SYNTHESIS_TEMPLATE.format(
             goal=goal,
             gates=format_gates(gates),
             manifest=manifest_text,
-            chunk_summaries=summary_text,
+            file_summaries=summary_text,
         )
         return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
 
@@ -155,6 +187,8 @@ class Reviewer:
         if verdict not in {"pass", "retry", "fail"}:
             raise YoloError(f"reviewer returned invalid verdict '{verdict}'")
         summary = summary_raw.strip()
+        if not summary:
+            raise YoloError("reviewer summary must be non-empty")
         if len(summary) > MAX_REVIEW_SUMMARY_CHARS:
             raise YoloError("reviewer summary is too large")
         if not isinstance(raw_findings, list):
@@ -171,6 +205,4 @@ class Reviewer:
             findings.append(finding)
         if verdict == "pass" and findings:
             raise YoloError("reviewer returned pass with material findings")
-        if verdict != "pass" and not summary and not any(findings):
-            raise YoloError("reviewer non-pass verdict must include a summary or finding")
         return ReviewResult(verdict, summary, tuple(findings))
