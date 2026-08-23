@@ -189,7 +189,11 @@ def build_review_chunks(
                 "candidate diff exceeds the 32 MB hierarchical-review safety ceiling; "
                 "split the release into smaller changes"
             )
-        pieces = _split_text(diff or f"[No textual diff for {path}]\n", chunk_bytes)
+        header_probe = f"\n===== FILE {path} PART 999999/999999 =====\n"
+        payload_budget = chunk_bytes - len(header_probe.encode("utf-8"))
+        if payload_budget < 1024:
+            raise YoloError(f"review chunk budget is too small for file path {path!r}")
+        pieces = _split_text(diff or f"[No textual diff for {path}]\n", payload_budget)
         for part_number, piece in enumerate(pieces, start=1):
             header = f"\n===== FILE {path} PART {part_number}/{len(pieces)} =====\n"
             payload = header + piece
