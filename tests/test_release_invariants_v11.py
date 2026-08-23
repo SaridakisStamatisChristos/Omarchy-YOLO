@@ -129,6 +129,9 @@ async def test_cleanup_failure_cannot_rewrite_completed_release(
         auto_apply=False,
     )
     task = db.add_tasks(job.id, [PlannedTask("T1", "Done", "Already completed")])[0]
+    db.update_task(task.id, state=TaskState.RUNNING)
+    db.update_task(task.id, state=TaskState.REVIEWING)
+    db.update_task(task.id, state=TaskState.INTEGRATING)
     db.update_task(task.id, state=TaskState.COMPLETED, result_summary="done")
 
     orchestrator = Orchestrator(config, db)

@@ -110,7 +110,8 @@ def test_prepare_resume_closes_stale_attempt_and_preserves_attempt_number(tmp_pa
     )
     task = db.add_tasks(job.id, [PlannedTask("T1", "Title", "Description")])[0]
     db.update_job(job.id, state=JobState.FAILED, error="boom")
-    db.update_task(task.id, state=TaskState.REVIEWING, attempts=3, last_error="useful context")
+    db.update_task(task.id, state=TaskState.RUNNING, attempts=3, last_error="useful context")
+    db.update_task(task.id, state=TaskState.REVIEWING)
     attempt_id = db.start_attempt(
         job_id=job.id,
         task_id=task.id,
