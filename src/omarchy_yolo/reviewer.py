@@ -4,23 +4,23 @@ from pathlib import Path
 
 from .agents import AgentRegistry
 from .model import GateResult, ReviewResult, TaskRecord
-from .prompts import FINAL_REVIEW_TEMPLATE, REVIEW_TEMPLATE
+from .prompts import FINAL_REVIEW_TEMPLATE, FINAL_SYNTHESIS_TEMPLATE, REVIEW_TEMPLATE
 from .util import YoloError, extract_json_object, truncate_utf8
 
 MAX_REVIEW_SUMMARY_CHARS = 8_000
 MAX_REVIEW_FINDINGS = 64
 MAX_REVIEW_FINDING_CHARS = 4_000
 MAX_GATE_SUMMARY_BYTES = 16_000
+MAX_SYNTHESIS_INPUT_BYTES = 80_000
 
 
 def format_gates(results: list[GateResult]) -> str:
     lines: list[str] = []
     for result in results:
-        command = getattr(result, "command", "?")
-        returncode = getattr(result, "returncode", "?")
-        timed_out = getattr(result, "timed_out", False)
-        stderr = str(getattr(result, "stderr", ""))[-1500:]
-        lines.append(f"- {command}: exit={returncode} timeout={timed_out}\n{stderr}")
+        stderr = result.stderr[-1500:]
+        lines.append(
+            f"- {result.command}: exit={result.returncode} timeout={result.timed_out}\n{stderr}"
+        )
     combined = "\n".join(lines) or "No explicit gates were run."
     return truncate_utf8(combined, MAX_GATE_SUMMARY_BYTES)
 
@@ -60,7 +60,70 @@ class Reviewer:
         timeout_seconds: int,
         log_path: Path,
     ) -> ReviewResult:
-        prompt = FINAL_REVIEW_TEMPLATE.format(goal=goal, gates=format_gates(gates), diff=diff)
+        return await self.review_final_chunk(
+            goal=goal,
+            diff=diff,
+            gates=gates,
+            files=("candidate",),
+            chunk_index=1,
+            chunk_total=1,
+            cwd=cwd,
+            agent_name=agent_name,
+            timeout_seconds=timeout_seconds,
+            log_path=log_path,
+        )
+
+    async def review_final_chunk(
+        self,
+        *,
+        goal: str,
+        diff: str,
+        gates: list[GateResult],
+        files: tuple[str, ...],
+        chunk_index: int,
+        chunk_total: int,
+        cwd: Path,
+        agent_name: str,
+        timeout_seconds: int,
+        log_path: Path,
+    ) -> ReviewResult:
+        prompt = FINAL_REVIEW_TEMPLATE.format(
+            goal=goal,
+            gates=format_gates(gates),
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
+            files="\n".join(f"- {path}" for path in files) or "- none",
+            diff=diff,
+        )
+        return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
+
+    async def review_final_synthesis(
+        self,
+        *,
+        goal: str,
+        gates: list[GateResult],
+        manifest: list[str],
+        chunk_reviews: list[ReviewResult],
+        cwd: Path,
+        agent_name: str,
+        timeout_seconds: int,
+        log_path: Path,
+    ) -> ReviewResult:
+        manifest_text = "\n".join(f"- {path}" for path in manifest) or "- no changed files"
+        summary_text = "\n".join(
+            f"- chunk {index}: {review.summary or 'passed'}"
+            for index, review in enumerate(chunk_reviews, start=1)
+        )
+        if len(manifest_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
+            raise YoloError("changed-file manifest is too large for complete synthesis review")
+        if len(summary_text.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
+            raise YoloError("chunk summaries are too large for complete synthesis review")
+        prompt = FINAL_SYNTHESIS_TEMPLATE.format(
+            goal=goal,
+            gates=format_gates(gates),
+            manifest=manifest_text,
+            chunk_summaries=summary_text,
+        )
         return await self._run(prompt, cwd, agent_name, timeout_seconds, log_path)
 
     async def _run(
@@ -106,6 +169,6 @@ class Reviewer:
             if len(finding) > MAX_REVIEW_FINDING_CHARS:
                 raise YoloError("reviewer finding is too large")
             findings.append(finding)
-        if verdict == "pass" and any(findings):
+        if verdict == "pass" and findings:
             raise YoloError("reviewer returned pass with material findings")
         return ReviewResult(verdict, summary, tuple(findings))
