@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=75", "wheel"]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "omarchy-yolo"
-version = "1.0.1"
+version = "1.1.0"
 description = "Persistent, multi-agent YOLO orchestration for Omarchy Quattro"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,6 +17,7 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Build Tools",
 ]
 dependencies = []
@@ -26,7 +27,13 @@ yolo = "omarchy_yolo.cli:main"
 omarchy-yolo = "omarchy_yolo.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.9", "mypy>=1.14"]
+dev = [
+  "pytest>=9.1",
+  "pytest-asyncio>=1.4",
+  "pytest-cov>=7.1",
+  "ruff>=0.16",
+  "mypy>=2.3",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -53,3 +60,12 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 packages = ["omarchy_yolo"]
+
+[tool.coverage.run]
+branch = true
+source = ["omarchy_yolo"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 70
