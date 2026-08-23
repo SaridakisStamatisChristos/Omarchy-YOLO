@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .model import JobRecord, JobState, TaskRecord, TaskState
-from .util import ensure_private_dir
+from .util import YoloError, ensure_private_dir
 
 
 SCHEMA = """
@@ -98,13 +98,27 @@ class DatabaseCore:
         ensure_private_dir(path.parent)
         self.path = path
         if path.is_symlink():
-            raise RuntimeError(f"refusing symlink for database path: {path}")
+            raise YoloError(f"refusing symlink for database path: {path}")
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        os.chmod(path, 0o600)
-        with self._lock:
-            self._conn.executescript(SCHEMA)
+        try:
+            self._conn = sqlite3.connect(
+                path,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+            self._conn.row_factory = sqlite3.Row
+            os.chmod(path, 0o600)
+            with self._lock:
+                self._conn.executescript(SCHEMA)
+                check = self._conn.execute("PRAGMA quick_check").fetchone()
+                if check is None or str(check[0]).lower() != "ok":
+                    detail = str(check[0]) if check is not None else "no result"
+                    raise sqlite3.DatabaseError(f"quick_check failed: {detail}")
+        except (sqlite3.DatabaseError, OSError) as exc:
+            connection = getattr(self, "_conn", None)
+            if connection is not None:
+                connection.close()
+            raise YoloError(f"database initialization/integrity check failed: {exc}") from exc
 
     def close(self) -> None:
         with self._lock:
@@ -114,6 +128,13 @@ class DatabaseCore:
         with self._lock:
             return self._conn.execute(sql, params)
 
+    def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
+
+    def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(sql, params).fetchall())
 
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> JobRecord:
