@@ -12,7 +12,7 @@ class Sandbox:
     def __init__(self, config: SandboxConfig):
         self.config = config
 
-    def wrap(self, argv: list[str], cwd: Path) -> list[str]:
+    def wrap(self, argv: list[str], cwd: Path, *, execution_profile: str) -> list[str]:
         backend = self.config.backend
         if backend == "native" or backend == "none":
             return argv
@@ -22,9 +22,10 @@ class Sandbox:
         if not executable:
             raise YoloError("sandbox backend 'bwrap' requested but bubblewrap is not installed")
 
-        # Read-only host with a writable worktree and ephemeral temp directories. By default
-        # HOME remains writable because several coding CLIs persist sessions/tokens there; set
-        # read_only_home=true for a tighter boundary after authenticating/test-driving the CLIs.
+        # The host root is read-only. Workers may optionally receive a writable HOME or a
+        # narrowly-scoped set of HOME subpaths. Planner/reviewer processes are always forced
+        # to a read-only HOME because their role is observational and must not mutate auth or
+        # session state even when worker mode is deliberately more permissive.
         wrapped = [
             executable,
             "--die-with-parent",
@@ -46,9 +47,22 @@ class Sandbox:
             "--chdir",
             str(cwd),
         ]
-        home = Path.home()
-        if not self.config.read_only_home and home.exists():
-            wrapped.extend(["--bind", str(home), str(home)])
+        home = Path.home().resolve()
+        force_read_only_home = execution_profile == "review"
+        if home.exists() and not force_read_only_home:
+            if not self.config.read_only_home:
+                wrapped.extend(["--bind", str(home), str(home)])
+            else:
+                for relative in self.config.writable_home_paths:
+                    candidate = (home / relative).resolve()
+                    try:
+                        candidate.relative_to(home)
+                    except ValueError as exc:
+                        raise YoloError(
+                            f"sandbox writable path escapes HOME: {relative}"
+                        ) from exc
+                    if candidate.exists():
+                        wrapped.extend(["--bind", str(candidate), str(candidate)])
         if not self.config.network:
             wrapped.append("--unshare-net")
         wrapped.extend(["--", *argv])
