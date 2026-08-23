@@ -946,7 +946,12 @@ async def test_process_prompt_and_logs_remain_exactly_bounded(tmp_path: Path) ->
 async def test_agent_and_gate_runners_terminate_surviving_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    leader_code = _surviving_descendant_leader_code()
+    leader_code = (
+        _surviving_descendant_leader_code()
+        + "import signal\n"
+        + "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+        + "time.sleep(30)\n"
+    )
     monkeypatch.setattr(
         "omarchy_yolo.process._PROCESS_TERMINATION_GRACE_SECONDS", 0.3
     )
