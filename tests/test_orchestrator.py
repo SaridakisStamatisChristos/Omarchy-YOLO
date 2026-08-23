@@ -17,6 +17,9 @@ class FakeAgent:
     def available(self) -> bool:
         return True
 
+    def supports_profile(self, execution_profile: str) -> bool:
+        return True
+
     async def run(
         self,
         prompt: str,
@@ -45,7 +48,7 @@ class FakeAgent:
                 ],
             }
             stdout = json.dumps(payload)
-        elif "adversarial senior code reviewer" in prompt or "final release auditor" in prompt:
+        elif "adversarial senior code reviewer" in prompt or "final release audit" in prompt:
             stdout = json.dumps({"verdict": "pass", "summary": "clean", "findings": []})
         elif "TASK T1" in prompt:
             (cwd / "result.txt").write_text("autonomous\n")
@@ -62,6 +65,7 @@ async def test_orchestrator_end_to_end(git_repo: Path, tmp_path: Path) -> None:
         config_path=tmp_path / "config.toml",
         engine=EngineConfig(
             max_parallel=2,
+            max_global_workers=2,
             max_attempts=2,
             max_final_cycles=1,
             planner_agent="fake",
@@ -71,7 +75,10 @@ async def test_orchestrator_end_to_end(git_repo: Path, tmp_path: Path) -> None:
             cleanup_worktrees=False,
         ),
         git=GitConfig(require_clean_repo=True),
-        gates=GateConfig(commands=("git status --porcelain=v1 >/dev/null",), final_commands=("git status --porcelain=v1 >/dev/null",)),
+        gates=GateConfig(
+            commands=("git status --porcelain=v1 >/dev/null",),
+            final_commands=("git status --porcelain=v1 >/dev/null",),
+        ),
     )
     db = Database(config.db_path)
     repo = GitRepo.discover(git_repo)
@@ -89,10 +96,14 @@ async def test_orchestrator_end_to_end(git_repo: Path, tmp_path: Path) -> None:
 
     finished = db.get_job(job.id)
     assert finished.state == JobState.COMPLETED
-    assert repo.head() == base  # source branch was untouched
+    assert repo.head() == base
     assert repo.branch_exists(finished.integration_branch)
     assert (Path(finished.integration_path) / "result.txt").read_text() == "autonomous\n"
     assert db.list_tasks(job.id)[0].state.value == "completed"
+    event_kinds = [event["kind"] for event in db.events(job.id, limit=100)]
+    assert "final.review_manifest" in event_kinds
+    assert "final.review_chunk" in event_kinds
+    assert "final.review_synthesis" in event_kinds
     db.close()
 
 
@@ -133,6 +144,7 @@ async def test_resume_gets_fresh_attempt_budget_without_erasing_attempt_numbers(
         config_path=tmp_path / "config.toml",
         engine=EngineConfig(
             max_parallel=1,
+            max_global_workers=1,
             max_attempts=1,
             max_final_cycles=0,
             planner_agent="fake",
