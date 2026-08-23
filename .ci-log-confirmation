@@ -1,0 +1,1 @@
+GitHub Actions PR run 32627420052 confirms the failure at src/omarchy_yolo/db.py:386: missing comma in recover_incomplete().
