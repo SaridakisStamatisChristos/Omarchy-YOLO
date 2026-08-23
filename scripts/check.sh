@@ -12,7 +12,7 @@ python -m pytest \
   --cov-branch \
   --cov-report=term-missing \
   --cov-report=json:coverage.json \
-  --cov-fail-under=75
+  --cov-fail-under=76
 python scripts/check_coverage.py coverage.json
 rm -f coverage.json
 

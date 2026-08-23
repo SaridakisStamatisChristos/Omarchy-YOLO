@@ -15,6 +15,15 @@ import sys
 if sys.version_info < (3, 12):
     raise SystemExit("Python 3.12+ is required")
 PY
+VERSION="$(python3 - "$ROOT/pyproject.toml" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+with Path(sys.argv[1]).open("rb") as handle:
+    print(tomllib.load(handle)["project"]["version"])
+PY
+)"
 
 mkdir -p "$APP_DIR/src" "$BIN_DIR" "$CONFIG_DIR" "$SERVICE_DIR"
 rm -rf "$APP_DIR/src/omarchy_yolo"
@@ -64,6 +73,6 @@ if command -v systemctl >/dev/null; then
   systemctl --user restart omarchy-yolo.service
 fi
 
-echo "Installed Omarchy YOLO 1.0.1"
+echo "Installed Omarchy YOLO $VERSION"
 echo "Run: yolo doctor"
 echo "Then: yolo run --watch \"Audit this repo, fix every material defect, and leave a release-ready candidate\""

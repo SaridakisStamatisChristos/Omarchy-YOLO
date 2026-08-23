@@ -11,11 +11,21 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .agents import AgentRegistry
 from .config import load_config
 from .daemon import run_daemon
+from .model import AgentRole
 from .omarchy import toggle_ui
 from .rpc import RpcError, RpcUnavailable, rpc_call
-from .util import YoloError, ensure_private_dir, terminal_safe, validate_job_id, xdg_runtime_dir
+from .util import (
+    YoloError,
+    ensure_private_dir,
+    open_private_binary,
+    read_tail_bounded,
+    terminal_safe,
+    validate_job_id,
+    xdg_runtime_dir,
+)
 
 
 TERMINAL_STATES = {"completed", "failed", "stopped"}
@@ -41,13 +51,17 @@ async def _ensure_daemon() -> None:
     ensure_private_dir(config.state_dir)
     systemctl = shutil.which("systemctl")
     if systemctl:
-        await asyncio.to_thread(
-            subprocess.run,
-            [systemctl, "--user", "start", "omarchy-yolo.service"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                [systemctl, "--user", "start", "omarchy-yolo.service"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            pass
         for _ in range(8):
             try:
                 await rpc_call(socket_path(), "ping")
@@ -57,7 +71,7 @@ async def _ensure_daemon() -> None:
 
     log_path = config.logs_dir / "daemon-bootstrap.log"
     ensure_private_dir(log_path.parent)
-    with log_path.open("ab") as log:
+    with open_private_binary(log_path, append=True) as log:
         await asyncio.to_thread(
             subprocess.Popen,
             [sys.executable, "-m", "omarchy_yolo.cli", "daemon"],
@@ -87,6 +101,22 @@ def _print_status(status: dict[str, Any]) -> None:
     counts = status.get("counts", {})
     if counts:
         print("tasks: " + "  ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    runtime = status.get("runtime", {})
+    if runtime:
+        print(
+            "runtime: "
+            f"workers={runtime.get('workers_active', 0)}/{runtime.get('worker_capacity', 0)} "
+            f"waiting={runtime.get('workers_waiting', 0)} "
+            f"repo-locks={runtime.get('repositories_active', 0)}"
+        )
+    telemetry = status.get("telemetry", {})
+    if telemetry.get("attempts_total"):
+        states = telemetry.get("states", {})
+        print(
+            "attempts: "
+            f"total={telemetry['attempts_total']} passed={states.get('passed', 0)} "
+            f"failed={states.get('failed', 0)} running={states.get('running', 0)}"
+        )
     for task in status.get("tasks", []):
         agent = task.get("preferred_agent") or "auto"
         print(
@@ -201,12 +231,19 @@ async def cmd_agents(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     else:
-        available = set(data["available"])
+        available = set(data.get("available", []))
+        available.update(data.get("review_available", []))
+        role_available = data.get("role_available", {})
+        if isinstance(role_available, dict):
+            for names in role_available.values():
+                if isinstance(names, list):
+                    available.update(str(name) for name in names)
         for name, cfg in data["configured"].items():
             state = "ready" if name in available else ("disabled" if not cfg["enabled"] else "missing")
             display_name = terminal_safe(name, single_line=True)
             command = terminal_safe(" ".join(cfg["command"]), single_line=True)
-            print(f"{display_name:<12} {state:<9} {command}")
+            roles = terminal_safe(",".join(cfg.get("roles", [])), single_line=True)
+            print(f"{display_name:<12} {state:<9} roles={roles or '-':<35} {command}")
     return 0
 
 
@@ -232,21 +269,44 @@ async def cmd_doctor(_: argparse.Namespace) -> int:
         checks.append(("daemon", False, "not running"))
 
     ready = True
+    registry = AgentRegistry(cfg)
     available_agents = 0
     for name, cfg_agent in cfg.agents.items():
         if not cfg_agent.enabled:
             continue
         executable = cfg_agent.command[0] if cfg_agent.command else ""
         resolved = shutil.which(executable) if executable else None
-        exists = resolved is not None
+        review_executable = cfg_agent.review_command[0] if cfg_agent.review_command else ""
+        review_resolved = shutil.which(review_executable) if review_executable else None
+        exists = resolved is not None or review_resolved is not None
         available_agents += int(exists)
-        checks.append((f"agent:{name}", exists, resolved or "missing"))
+        detail = resolved or (
+            f"review-only={review_resolved}" if review_resolved is not None else "missing"
+        )
+        checks.append((f"agent:{name}", exists, detail))
     checks.append(("agent-ready", available_agents > 0, f"{available_agents} usable agent(s)"))
+    for role in (
+        AgentRole.WORKER,
+        AgentRole.PLANNER,
+        AgentRole.REVIEWER,
+        AgentRole.INTEGRATOR,
+    ):
+        role_agents = registry.available(role=role)
+        checks.append(
+            (
+                f"role:{role.value}",
+                bool(role_agents),
+                ", ".join(role_agents) if role_agents else "none",
+            )
+        )
 
     for name, ok, detail in checks:
         marker = "OK" if ok else "!!"
         print(f"[{marker}] {name:<16} {terminal_safe(detail, single_line=True)}")
-        if name in {"python", "linux", "non-root", "git", "agent-ready"} and not ok:
+        if (
+            name in {"python", "linux", "non-root", "git", "agent-ready"}
+            or name.startswith("role:")
+        ) and not ok:
             ready = False
     return 0 if ready else 1
 
@@ -270,10 +330,14 @@ def cmd_logs(args: argparse.Namespace) -> int:
     if not root.exists():
         print(f"No logs for {job_id}", file=sys.stderr)
         return 1
-    files = sorted(root.rglob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(
+        (path for path in root.rglob("*.log") if path.is_file() and not path.is_symlink()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     if args.latest and files:
         count = min(2_000_000, max(1, args.bytes))
-        text = files[0].read_text(errors="replace")[-count:]
+        text = read_tail_bounded(files[0], max_bytes=count)
         print(text if args.raw else terminal_safe(text, max_chars=2_000_000))
         return 0
     for path in files:

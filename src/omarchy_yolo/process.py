@@ -7,7 +7,63 @@ import time
 from pathlib import Path
 
 from .model import AgentResult
-from .util import YoloError, ensure_private_dir, open_private_binary, shell_join
+from .util import (
+    YoloError,
+    ensure_private_dir,
+    finish_before_cancel,
+    open_private_binary,
+    shell_join,
+)
+
+_LOG_TRUNCATION_MARKER = b"\n[omarchy-yolo: log output truncated]\n"
+_PIPE_DRAIN_TIMEOUT_SECONDS = 2.0
+_PROCESS_TERMINATION_GRACE_SECONDS = 5.0
+
+
+async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Terminate the whole session even when its original leader already exited."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        if proc.returncode is None:
+            await proc.wait()
+        return
+
+    deadline = time.monotonic() + _PROCESS_TERMINATION_GRACE_SECONDS
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(
+                proc.wait(), timeout=_PROCESS_TERMINATION_GRACE_SECONDS
+            )
+        except TimeoutError:
+            pass
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(0.01)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if proc.returncode is None:
+        await proc.wait()
+
+
+async def _drain_process_pumps(
+    proc: asyncio.subprocess.Process,
+    tasks: list[asyncio.Task[None]],
+) -> tuple[list[object], bool]:
+    """Bound pipe draining and terminate descendants that outlive the leader."""
+    _, pending = await asyncio.wait(tasks, timeout=_PIPE_DRAIN_TIMEOUT_SECONDS)
+    drain_timed_out = bool(pending)
+    if pending:
+        await _terminate_process_group(proc)
+        _, pending = await asyncio.wait(pending, timeout=_PIPE_DRAIN_TIMEOUT_SECONDS)
+    for task in pending:
+        task.cancel()
+    return list(await asyncio.gather(*tasks, return_exceptions=True)), drain_timed_out
 
 
 class ProcessRunner:
@@ -70,17 +126,27 @@ class ProcessRunner:
                         del target[: len(target) - self.capture_limit_bytes]
                     async with lock:
                         if logged_bytes < self.log_limit_bytes:
-                            remaining = self.log_limit_bytes - logged_bytes
                             payload = prefix + chunk
                             if not chunk.endswith(b"\n"):
                                 payload += b"\n"
-                            payload = payload[:remaining]
+                            remaining = self.log_limit_bytes - logged_bytes
+                            payload_budget = max(
+                                0, remaining - len(_LOG_TRUNCATION_MARKER)
+                            )
+                            truncated_now = len(payload) > payload_budget
+                            payload = payload[:payload_budget]
                             with open_private_binary(log_path, append=True) as fh:
                                 fh.write(payload)
                             logged_bytes += len(payload)
-                        elif not log_truncated:
-                            with open_private_binary(log_path, append=True) as fh:
-                                fh.write(b"\n[omarchy-yolo: log output truncated]\n")
+                            if truncated_now and not log_truncated:
+                                marker = _LOG_TRUNCATION_MARKER[
+                                    : self.log_limit_bytes - logged_bytes
+                                ]
+                                with open_private_binary(log_path, append=True) as fh:
+                                    fh.write(marker)
+                                logged_bytes += len(marker)
+                                log_truncated = True
+                        else:
                             log_truncated = True
             except (OSError, YoloError):
                 await self._terminate_group(proc)
@@ -99,11 +165,15 @@ class ProcessRunner:
             await self._terminate_group(proc)
             raise
         finally:
-            pump_results = list(await asyncio.gather(out_task, err_task, return_exceptions=True))
+            pump_results, drain_timed_out = await finish_before_cancel(
+                _drain_process_pumps(proc, [out_task, err_task])
+            )
 
         for pump_result in pump_results:
-            if isinstance(pump_result, (OSError, YoloError)):
+            if isinstance(pump_result, BaseException):
                 raise pump_result
+        if drain_timed_out:
+            raise YoloError("agent output pipes did not close after command exit")
 
         rc = proc.returncode if proc.returncode is not None else 124
         if timed_out and rc == 0:
@@ -118,19 +188,4 @@ class ProcessRunner:
 
     @staticmethod
     async def _terminate_group(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            return
-        except TimeoutError:
-            pass
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        await proc.wait()
+        await _terminate_process_group(proc)

@@ -33,6 +33,13 @@ class AttemptState(StrEnum):
     CANCELLED = "cancelled"
 
 
+class AgentRole(StrEnum):
+    WORKER = "worker"
+    PLANNER = "planner"
+    REVIEWER = "reviewer"
+    INTEGRATOR = "integrator"
+
+
 @dataclass(slots=True, frozen=True)
 class PlannedTask:
     logical_id: str
@@ -134,3 +141,5 @@ class TaskRecord:
     base_commit: str = ""
     last_error: str = ""
     result_summary: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0

@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import signal
+import stat
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
@@ -15,14 +16,15 @@ from .agents import AgentRegistry
 from .config import Config, load_config
 from .db import MAX_EVENT_LIST_LIMIT, MAX_JOB_LIST_LIMIT, Database
 from .git import GitRepo
-from .model import JobRecord, JobState, TaskState
+from .model import AgentRole, JobRecord, JobState, TaskState
 from .orchestrator import Orchestrator
 from .rpc import MAX_RPC_MESSAGE_BYTES
 from .runtime import ResourceCoordinator
-from .util import YoloError, current_uid, ensure_private_dir, new_id, xdg_runtime_dir
+from .util import YoloError, current_uid, ensure_private_dir, new_id, utc_ts, xdg_runtime_dir
 
 MAX_GOAL_CHARS = 16_000
 MAX_REPO_PATH_CHARS = 4_096
+MAX_STATUS_RESPONSE_BYTES = MAX_RPC_MESSAGE_BYTES - 65_536
 
 
 class YoloDaemon:
@@ -71,7 +73,8 @@ class YoloDaemon:
     async def shutdown(self) -> None:
         if self.server is not None:
             self.server.close()
-            await self.server.wait_closed()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.server.wait_closed(), timeout=5)
             self.server = None
         active = [task for task in self.runners.values() if not task.done()]
         for task in active:
@@ -87,7 +90,21 @@ class YoloDaemon:
     def _acquire_singleton_lock(self) -> None:
         if self._lock_handle is not None:
             return
-        handle = self.lock_path.open("a+", encoding="utf-8")
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.lock_path, flags, 0o600)
+        except OSError as exc:
+            raise YoloError(f"cannot safely open daemon lock: {self.lock_path}: {exc}") from exc
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+        ):
+            os.close(fd)
+            raise YoloError(f"refusing unsafe daemon lock file: {self.lock_path}")
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "a+", encoding="utf-8")
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -169,13 +186,13 @@ class YoloDaemon:
                     + "\n"
                 ).encode()
             writer.write(encoded)
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=30)
         except (json.JSONDecodeError, TimeoutError, YoloError):
             return
         finally:
             writer.close()
             with contextlib.suppress(Exception):
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=5)
 
     @staticmethod
     def _bounded_int(value: object, *, default: int, minimum: int, maximum: int, name: str) -> int:
@@ -273,14 +290,26 @@ class YoloDaemon:
             self._spawn(job_id)
             return self._status(job_id)
         if method == "agents":
+            contracts = self.registry.contracts()
             return {
-                "available": self.registry.available(),
-                "review_available": self.registry.available("review"),
+                "available": self.registry.available(role=AgentRole.WORKER),
+                "review_available": self.registry.available(role=AgentRole.REVIEWER),
+                "role_available": {
+                    role.value: self.registry.available(role=role) for role in AgentRole
+                },
                 "configured": {
                     name: {
                         "enabled": cfg.enabled,
                         "command": list(cfg.command),
                         "review_command": list(cfg.review_command),
+                        "roles": contracts.get(name, {}).get("roles", []),
+                        "executable": contracts.get(name, {}).get("executable", ""),
+                        "review_executable": contracts.get(name, {}).get(
+                            "review_executable", ""
+                        ),
+                        "review_capability": contracts.get(name, {}).get(
+                            "review_capability", "none"
+                        ),
                     }
                     for name, cfg in self.config.agents.items()
                 },
@@ -310,6 +339,57 @@ class YoloDaemon:
             used += size
         return result
 
+    @staticmethod
+    def _bound_status_response(status: dict[str, Any]) -> dict[str, Any]:
+        """Keep status usable under the RPC ceiling without dropping task identity/state."""
+
+        def encoded_size() -> int:
+            return len(json.dumps(status, default=str, separators=(",", ":")).encode())
+
+        if encoded_size() <= MAX_STATUS_RESPONSE_BYTES:
+            return status
+
+        status["truncated"] = True
+        events = status.get("last_events", [])
+        if isinstance(events, list):
+            for event in events:
+                if isinstance(event, dict):
+                    event["payload"] = {"truncated": True}
+        tasks = status.get("tasks", [])
+        if isinstance(tasks, list):
+            for task in tasks:
+                if isinstance(task, dict):
+                    task["last_error"] = str(task.get("last_error", ""))[-512:]
+                    task["result_summary"] = str(task.get("result_summary", ""))[-512:]
+        if encoded_size() <= MAX_STATUS_RESPONSE_BYTES:
+            return status
+
+        job = status.get("job")
+        if isinstance(job, dict):
+            job["goal"] = str(job.get("goal", ""))[:2_000]
+            job["final_summary"] = str(job.get("final_summary", ""))[-2_000:]
+            job["error"] = str(job.get("error", ""))[-2_000:]
+        if isinstance(tasks, list):
+            for task in tasks:
+                if isinstance(task, dict):
+                    task["branch"] = ""
+                    task["worktree"] = ""
+                    task["last_error"] = str(task.get("last_error", ""))[-128:]
+                    task["result_summary"] = str(task.get("result_summary", ""))[-128:]
+        if encoded_size() <= MAX_STATUS_RESPONSE_BYTES:
+            return status
+
+        status["last_events"] = []
+        if isinstance(tasks, list):
+            for task in tasks:
+                if isinstance(task, dict):
+                    task["title"] = str(task.get("title", ""))[:80]
+                    task["last_error"] = ""
+                    task["result_summary"] = ""
+        if encoded_size() > MAX_STATUS_RESPONSE_BYTES:
+            raise YoloError("status metadata exceeds the bounded RPC response ceiling")
+        return status
+
     async def _submit(self, params: dict[str, Any]) -> dict[str, Any]:
         goal = str(params.get("goal", "")).strip()
         if not goal:
@@ -319,7 +399,12 @@ class YoloDaemon:
         repo_value = str(params.get("repo", "."))
         if len(repo_value) > MAX_REPO_PATH_CHARS:
             raise YoloError("repository path is too long")
-        repo = GitRepo.discover(Path(repo_value).expanduser())
+        repo = await asyncio.to_thread(
+            GitRepo.discover,
+            Path(repo_value).expanduser(),
+            command_timeout_seconds=self.config.git.command_timeout_seconds,
+            allow_repository_commands=self.config.git.allow_repository_commands,
+        )
         async with self.coordinator.repo_lock(repo.root):
             base_branch, base_commit = await asyncio.to_thread(
                 repo.preflight, require_clean=self.config.git.require_clean_repo
@@ -349,8 +434,16 @@ class YoloDaemon:
             job = self.db.latest_job()
         runtime = self.coordinator.snapshot()
         if job is None:
-            return {"job": None, "tasks": [], "counts": {}, "runtime": runtime}
+            return {
+                "job": None,
+                "tasks": [],
+                "counts": {},
+                "runtime": runtime,
+                "telemetry": {"attempts_total": 0, "states": {}, "by_agent": {}},
+            }
         tasks = self.db.list_tasks(job.id)
+        latest_attempts = self.db.latest_attempts(job.id)
+        now = utc_ts()
         counts: dict[str, int] = {}
         for task in tasks:
             counts[task.state.value] = counts.get(task.state.value, 0) + 1
@@ -368,27 +461,30 @@ class YoloDaemon:
                 "worktree": task.worktree,
                 "last_error": task.last_error[-2_000:],
                 "result_summary": task.result_summary[-2_000:],
+                "created_at": task.created_at,
+                "updated_at": task.updated_at,
+                "state_age_seconds": round(max(0.0, now - task.updated_at), 3),
+                "latest_attempt": latest_attempts.get(task.id),
             }
             for task in tasks
         ]
-        last_events = self._events_bounded(
-            self.db.events(
-                job.id,
-                after_id=max(0, self.db.last_event_id(job.id) - 12),
-                limit=12,
-            )
-        )
+        last_events = self._events_bounded(self.db.recent_events(job.id, limit=12))
         job_item = asdict(job)
         job_item["goal"] = job.goal[:MAX_GOAL_CHARS]
         job_item["final_summary"] = job.final_summary[-8_000:]
         job_item["error"] = job.error[-8_000:]
-        return {
+        return self._bound_status_response({
             "job": job_item,
             "tasks": task_items,
             "counts": counts,
             "last_events": last_events,
             "runtime": runtime,
-        }
+            "telemetry": {
+                **self.db.attempt_metrics(job.id),
+                "job_elapsed_seconds": round(max(0.0, now - job.created_at), 3),
+                "state_age_seconds": round(max(0.0, now - job.updated_at), 3),
+            },
+        })
 
 
 async def run_daemon(config: Config | None = None) -> None:

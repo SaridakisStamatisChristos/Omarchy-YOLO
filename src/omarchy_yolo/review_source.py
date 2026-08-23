@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
-import signal
-import subprocess
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 from .git import GitRepo
 from .util import YoloError
@@ -25,63 +24,49 @@ class ReviewChunk:
 
 def _git_bytes(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> bytes:
     repo.assert_worktree(cwd)
-    argv = [
-        "git",
-        "-C",
-        str(cwd),
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "diff.external=",
+    out = repo.run_bytes(
         *args,
-    ]
-    env = os.environ.copy()
-    env.setdefault("GIT_PAGER", "cat")
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        start_new_session=True,
+        cwd=cwd,
+        check=False,
+        max_stdout_bytes=max_bytes,
+        max_stderr_bytes=64_000,
     )
-    assert proc.stdout is not None
-    data = cast(bytes, proc.stdout.read(max_bytes + 1))
-    truncated = len(data) > max_bytes
-    if truncated and proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait()
-    if truncated:
+    if out.timed_out:
+        raise YoloError(
+            f"Git review query timed out after {repo.command_timeout_seconds} seconds"
+        )
+    if out.output_truncated:
         raise YoloError(
             f"candidate review data exceeds the safety ceiling ({max_bytes} bytes); "
             "split the change into smaller tasks"
         )
-    if proc.returncode != 0:
+    if out.returncode != 0:
         raise YoloError(
-            f"Git review query failed with exit {proc.returncode}: {' '.join(args[:4])}"
+            f"Git review query failed with exit {out.returncode}: {' '.join(args[:4])}"
         )
-    return data
+    return out.stdout
 
 
 def _git_text(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> str:
     return _git_bytes(repo, cwd, args, max_bytes).decode("utf-8", errors="replace")
 
 
+_PLAIN_PROMPT_PATH_RE = re.compile(
+    r"^[A-Za-z0-9._/@+\-](?:[A-Za-z0-9._/@+ \-]*[A-Za-z0-9._/@+\-])?$"
+)
+_ENCODED_PATH_PREFIX = "json:"
+
+
 def _display_path(path: str) -> str:
-    """Make an arbitrary POSIX filename safe for UTF-8 prompts without losing identity."""
-    return path.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    """Return an injective, single-line representation safe for model prompts.
+
+    Ordinary project paths remain readable and backward compatible. Exotic paths
+    use an explicitly tagged JSON string; reserving the tag for encoded values
+    makes the representation collision-free.
+    """
+    if _PLAIN_PROMPT_PATH_RE.fullmatch(path) and not path.startswith(_ENCODED_PATH_PREFIX):
+        return path
+    return _ENCODED_PATH_PREFIX + json.dumps(path, ensure_ascii=True)
 
 
 def changed_files(repo: GitRepo, cwd: Path, base: str, *, max_files: int) -> list[str]:

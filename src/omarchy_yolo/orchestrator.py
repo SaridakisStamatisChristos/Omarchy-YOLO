@@ -8,7 +8,7 @@ from .config import Config
 from .db import Database
 from .gates import GateRunner
 from .git import GitError, GitRepo
-from .model import JobState, PlannedTask, TaskState
+from .model import AgentRole, JobRecord, JobState, PlannedTask, TaskState
 from .omarchy import notify
 from .orchestrator_integration import IntegrationMixin
 from .orchestrator_task import TaskExecutionMixin
@@ -16,7 +16,7 @@ from .planner import Planner
 from .reviewer import Reviewer
 from .runtime import ResourceCoordinator
 from .sandbox import Sandbox
-from .util import YoloError, ensure_private_dir
+from .util import YoloError, atomic_to_thread, ensure_private_dir, finish_before_cancel
 
 
 class TaskExecutionError(YoloError):
@@ -45,23 +45,27 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
 
     async def run_job(self, job_id: str) -> None:
         job = self.db.get_job(job_id)
-        repo = GitRepo(Path(job.repo))
+        repo = GitRepo(
+            Path(job.repo),
+            command_timeout_seconds=self.config.git.command_timeout_seconds,
+            allow_repository_commands=self.config.git.allow_repository_commands,
+        )
         job_root = ensure_private_dir(self.config.worktrees_dir / job_id)
         integration_path = job_root / "integration"
         try:
             async with self.coordinator.repo_lock(repo.root):
-                await asyncio.to_thread(
+                await atomic_to_thread(
                     repo.ensure_existing_branch_worktree,
                     integration_path,
                     job.integration_branch,
                     job.base_commit,
                 )
                 if await asyncio.to_thread(repo.merge_in_progress, integration_path):
-                    await asyncio.to_thread(repo.abort_merge, integration_path)
+                    await atomic_to_thread(repo.abort_merge, integration_path)
                     self.db.event(job_id, "integration.recovered_merge_abort")
                 if not await asyncio.to_thread(repo.is_clean, integration_path):
                     head = await asyncio.to_thread(repo.head, integration_path)
-                    await asyncio.to_thread(repo.reset_hard, integration_path, head)
+                    await atomic_to_thread(repo.reset_hard, integration_path, head)
                     self.db.event(job_id, "integration.recovered_dirty_reset", {"head": head})
             self.db.update_job(job_id, integration_path=str(integration_path))
             self.db.event(
@@ -84,35 +88,19 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             async with self.coordinator.worker_slot():
                 final_summary = await self._finalize(job_id, repo, integration_path)
             job = self.db.get_job(job_id)
-            if job.auto_apply:
-                try:
-                    async with self.coordinator.repo_lock(repo.root):
-                        await asyncio.to_thread(
-                            repo.fast_forward_source,
-                            job.integration_branch,
-                            job.base_branch,
-                            job.base_commit,
-                        )
-                    self.db.event(job_id, "job.applied", {"branch": job.base_branch})
-                except GitError as exc:
-                    self.db.event(job_id, "job.apply_skipped", {"reason": str(exc)})
-
-            self.db.update_job(
-                job_id,
-                state=JobState.COMPLETED,
-                final_summary=final_summary,
-                error="",
+            # Final review is the acceptance boundary. If cancellation arrives while
+            # optional source application is in flight, finish application/refusal and
+            # persist completion together so an applied source can never be re-queued.
+            await finish_before_cancel(
+                self._complete_accepted_job(job, repo, final_summary)
             )
-            self.db.event(
-                job_id,
-                "job.completed",
-                {"summary": final_summary, "branch": job.integration_branch},
-            )
-            notify("YOLO completed", f"{Path(job.repo).name}: {job.integration_branch}")
 
             if self.config.engine.cleanup_worktrees:
                 try:
                     await self._cleanup_completed(repo, job_id, integration_path)
+                except asyncio.CancelledError:
+                    self.db.event(job_id, "job.cleanup_interrupted")
+                    raise
                 except Exception as exc:
                     self.db.event(
                         job_id,
@@ -122,6 +110,8 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         except asyncio.CancelledError:
             await self._cancel_active()
             current = self.db.get_job(job_id)
+            if current.state == JobState.COMPLETED:
+                raise
             if current.stop_requested:
                 self.db.settle_inflight(
                     job_id,
@@ -155,6 +145,43 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             notify("YOLO failed", f"{Path(job.repo).name}: {str(exc)[:180]}")
             raise
 
+    async def _complete_accepted_job(
+        self,
+        job: JobRecord,
+        repo: GitRepo,
+        final_summary: str,
+    ) -> None:
+        accepted = self.db.get_job(job.id)
+        if accepted.auto_apply:
+            try:
+                async with self.coordinator.repo_lock(repo.root):
+                    await atomic_to_thread(
+                        repo.fast_forward_source,
+                        accepted.integration_branch,
+                        accepted.base_branch,
+                        accepted.base_commit,
+                    )
+                self.db.event(accepted.id, "job.applied", {"branch": accepted.base_branch})
+            except GitError as exc:
+                self.db.event(accepted.id, "job.apply_skipped", {"reason": str(exc)})
+
+        self.db.update_job(
+            accepted.id,
+            state=JobState.COMPLETED,
+            stop_requested=False,
+            final_summary=final_summary,
+            error="",
+        )
+        self.db.event(
+            accepted.id,
+            "job.completed",
+            {"summary": final_summary, "branch": accepted.integration_branch},
+        )
+        notify(
+            "YOLO completed",
+            f"{Path(accepted.repo).name}: {accepted.integration_branch}",
+        )
+
     async def _plan_job(self, job_id: str, integration_path: Path) -> None:
         job = self.db.get_job(job_id)
         self.db.update_job(job_id, state=JobState.PLANNING)
@@ -162,7 +189,7 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         planner_name = self.registry.choose_role(
             self.config.engine.planner_agent,
             self.config.engine.worker_agents,
-            execution_profile="review",
+            role=AgentRole.PLANNER,
         )
         log_path = self.config.logs_dir / job_id / "planner.log"
         try:

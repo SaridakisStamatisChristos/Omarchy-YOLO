@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.0 - 2026-08-23
+
+- Make every control-plane Git subprocess finite and output-bounded, terminate descendant process groups even after a command leader exits, disable ambient Git redirection/config, and use the configured release identity for unsigned integration commits; apply the same surviving-descendant cleanup to agent and gate timeouts.
+- Defer task cancellation until blocking Git mutations finish so repository locks cannot be released while an uncancellable worker thread still changes shared worktree/ref state, and revalidate persisted worktrees against the canonical repository and expected branch before recovery reuse.
+- Roll back an integration transaction on cancellation, atomically persist acceptance around optional source application, and preserve an already completed job when post-release cleanup is interrupted.
+- Add opt-in `sandbox.hostile_repo_mode`: every Bubblewrap child receives fresh HOME/runtime and filtered environment views, only explicit HOME exceptions reach agents, gates are forced offline, and repository Git filters/merge drivers are neutralized.
+- Add formal worker/planner/reviewer/integrator capability contracts, optional per-agent role allowlists, review-only adapters, executable identity checks, doctor validation, and RPC introspection.
+- Make hostile/non-UTF-8 changed-file labels injective and single-line so filenames cannot forge final-review prompt structure while ordinary paths retain their stable representation.
+- Correct recent-event status under interleaved multi-job event IDs; expose per-attempt agent/state/duration, task state age, job duration, scheduler wait/busy counters, peaks, and cancellation telemetry; and compact oversized status diagnostics without dropping task identity/state from the RPC response.
+- Expand the Omarchy Quickshell panel with active/review/integration counts, worker capacity/waiters, attempts, durations, state age, per-task agent telemetry, failure badges, and the latest durable event.
+- Harden daemon/CLI lifecycle edges with bounded RPC drains/closes, bounded UI/systemd activation, private non-symlink log reads, and a no-follow/single-link singleton lock.
+- Add deterministic state-matrix, recovery, cancellation, hostile-filter, timeout/output, identity, isolation, telemetry, prompt-boundary, and CLI-contract regression tests.
+- Raise aggregate branch coverage enforcement to 76% and raise the Git, gate/process, orchestration, DB-record, runtime, sandbox, and review-source module floors without weakening any existing gate.
+- Keep package, daemon, installer, and Omarchy plugin release versions synchronized at `1.3.0`.
+
 ## 1.2.0 - 2026-08-23
 
 - Make gate execution fail closed on durable-log/storage errors: mid-stream failures terminate the gate process group and propagate instead of being discarded.

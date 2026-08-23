@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -8,7 +9,8 @@ import stat
 import time
 import uuid
 from pathlib import Path
-from typing import Any, BinaryIO
+from collections.abc import Awaitable, Callable
+from typing import Any, BinaryIO, ParamSpec, TypeVar
 
 
 class YoloError(RuntimeError):
@@ -19,6 +21,8 @@ MAX_STRUCTURED_OUTPUT_CHARS = 262_144
 MAX_JSON_DECODE_ATTEMPTS = 512
 _JOB_ID_RE = re.compile(r"^job_[0-9a-f]{12}$")
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def current_uid() -> int:
@@ -27,6 +31,45 @@ def current_uid() -> int:
 
 def utc_ts() -> float:
     return time.time()
+
+
+async def atomic_to_thread(
+    function: Callable[_P, _R],
+    /,
+    *args: _P.args,
+    **kwargs: _P.kwargs,
+) -> _R:
+    """Finish a blocking side effect before allowing cancellation to escape.
+
+    ``asyncio.to_thread`` cannot stop its worker thread. Awaiting it directly under a
+    repository lock lets cancellation release that lock while Git is still mutating
+    shared state. This helper defers propagation of any cancellation until the thread
+    has terminated; the blocking operation itself must still enforce a finite timeout.
+    """
+
+    return await finish_before_cancel(asyncio.to_thread(function, *args, **kwargs))
+
+
+async def finish_before_cancel(awaitable: Awaitable[_R]) -> _R:
+    """Let a bounded critical awaitable settle before propagating cancellation."""
+    inner = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not inner.done():
+        try:
+            await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    try:
+        result = inner.result()
+    except BaseException as exc:
+        if cancelled:
+            raise asyncio.CancelledError from exc
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 def new_id(prefix: str) -> str:
@@ -180,4 +223,24 @@ def read_text_bounded(path: Path, *, max_bytes: int, errors: str = "strict") -> 
         data = fh.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise YoloError(f"file exceeds {max_bytes} byte inspection limit: {path}")
+    return data.decode("utf-8", errors=errors)
+
+
+def read_tail_bounded(path: Path, *, max_bytes: int, errors: str = "replace") -> str:
+    """Read a bounded file tail without following a final-component symlink."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise YoloError(f"cannot safely read file: {path}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise YoloError(f"refusing non-regular file: {path}")
+        os.lseek(fd, max(0, info.st_size - max_bytes), os.SEEK_SET)
+        data = os.read(fd, max_bytes)
+    finally:
+        os.close(fd)
     return data.decode("utf-8", errors=errors)
