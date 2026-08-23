@@ -15,6 +15,7 @@ from .orchestrator_task import TaskExecutionMixin
 from .planner import Planner
 from .reviewer import Reviewer
 from .runtime import ResourceCoordinator
+from .sandbox import Sandbox
 from .util import YoloError, ensure_private_dir
 
 
@@ -35,7 +36,7 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         self.config = config
         self.db = db
         self.registry = registry or AgentRegistry(config)
-        self.gates = gate_runner or GateRunner()
+        self.gates = gate_runner or GateRunner(sandbox=Sandbox(config.sandbox))
         self.planner = Planner(self.registry, max_tasks=config.engine.max_tasks)
         self.reviewer = Reviewer(self.registry)
         self.coordinator = coordinator or ResourceCoordinator(config.engine.max_global_workers)
@@ -113,9 +114,6 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                 try:
                     await self._cleanup_completed(repo, job_id, integration_path)
                 except Exception as exc:
-                    # Cleanup is post-release housekeeping. Once the candidate has passed all
-                    # gates/review and the job is durably completed, a stale worktree must not
-                    # rewrite that completed result to FAILED.
                     self.db.event(
                         job_id,
                         "job.cleanup_failed",
