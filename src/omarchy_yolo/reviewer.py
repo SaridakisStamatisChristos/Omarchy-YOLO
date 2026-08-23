@@ -171,4 +171,6 @@ class Reviewer:
             findings.append(finding)
         if verdict == "pass" and findings:
             raise YoloError("reviewer returned pass with material findings")
+        if verdict != "pass" and not summary and not any(findings):
+            raise YoloError("reviewer non-pass verdict must include a summary or finding")
         return ReviewResult(verdict, summary, tuple(findings))
