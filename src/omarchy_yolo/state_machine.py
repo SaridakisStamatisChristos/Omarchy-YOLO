@@ -20,8 +20,12 @@ JOB_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.RUNNING: frozenset(
         {JobState.RUNNING, JobState.QUEUED, JobState.STOPPING, JobState.COMPLETED, JobState.FAILED}
     ),
+    # Final review is the acceptance boundary. A stop request can race the
+    # cancellation-shielded accepted-completion section after that boundary. If
+    # source application/provenance has already begun, completion must be allowed
+    # to win the race so an applied accepted release is never recorded as stopped.
     JobState.STOPPING: frozenset(
-        {JobState.STOPPING, JobState.STOPPED, JobState.QUEUED, JobState.FAILED}
+        {JobState.STOPPING, JobState.STOPPED, JobState.QUEUED, JobState.COMPLETED, JobState.FAILED}
     ),
     JobState.STOPPED: frozenset({JobState.STOPPED, JobState.QUEUED}),
     JobState.FAILED: frozenset({JobState.FAILED, JobState.QUEUED}),
