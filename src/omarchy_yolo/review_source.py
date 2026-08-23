@@ -13,6 +13,7 @@ from .util import YoloError
 MAX_CHANGED_FILE_LIST_BYTES = 2_000_000
 MAX_SINGLE_FILE_DIFF_BYTES = 4_000_000
 MAX_TOTAL_REVIEW_DIFF_BYTES = 32_000_000
+MAX_BINARY_METADATA_BYTES = 32_000
 
 
 @dataclass(slots=True, frozen=True)
@@ -90,14 +91,44 @@ def changed_files(repo: GitRepo, cwd: Path, base: str, *, max_files: int) -> lis
         ["diff", "--name-only", "-z", f"{base}..HEAD"],
         MAX_CHANGED_FILE_LIST_BYTES,
     )
-    # os.fsdecode uses the platform's surrogateescape strategy on Linux, allowing the
-    # resulting str to be passed back to subprocess and recover the original path bytes.
     files = [os.fsdecode(item) for item in raw.split(b"\0") if item]
     if len(files) > max_files:
         raise YoloError(
             f"candidate changes {len(files)} files; configured final-review maximum is {max_files}"
         )
     return files
+
+
+def _is_binary_change(repo: GitRepo, cwd: Path, base: str, path: str) -> bool:
+    raw = _git_bytes(
+        repo,
+        cwd,
+        ["diff", "--numstat", "-z", f"{base}..HEAD", "--", path],
+        MAX_BINARY_METADATA_BYTES,
+    )
+    first_record = raw.split(b"\0", 1)[0]
+    fields = first_record.split(b"\t", 2)
+    return len(fields) >= 2 and fields[0] == b"-" and fields[1] == b"-"
+
+
+def _binary_metadata(repo: GitRepo, cwd: Path, base: str, path: str) -> str:
+    raw = _git_text(
+        repo,
+        cwd,
+        ["diff", "--raw", "--full-index", f"{base}..HEAD", "--", path],
+        MAX_BINARY_METADATA_BYTES,
+    )
+    summary = _git_text(
+        repo,
+        cwd,
+        ["diff", "--summary", f"{base}..HEAD", "--", path],
+        MAX_BINARY_METADATA_BYTES,
+    )
+    return (
+        "[Binary content review explicitly allowed; content is not interpreted. "
+        "Review object hashes/modes/provenance metadata only.]\n"
+        f"RAW:\n{raw}\nSUMMARY:\n{summary}"
+    )
 
 
 def _file_diff(repo: GitRepo, cwd: Path, base: str, path: str) -> str:
@@ -166,7 +197,10 @@ def build_review_chunks(
     max_files: int,
     chunk_bytes: int,
     chunk_files: int,
+    allow_binary: bool = False,
 ) -> tuple[list[str], list[ReviewChunk]]:
+    if chunk_files < 1:
+        raise ValueError("chunk_files must be positive")
     actual_files = changed_files(repo, cwd, base, max_files=max_files)
     if not actual_files:
         return [], [ReviewChunk(index=1, files=(), text="No changed files.")]
@@ -182,10 +216,13 @@ def build_review_chunks(
         nonlocal current_parts, current_files, current_bytes
         if not current_parts:
             return
+        unique_files = tuple(dict.fromkeys(current_files))
+        if len(unique_files) > 1:
+            raise YoloError("internal review invariant violated: a shard spans multiple files")
         chunks.append(
             ReviewChunk(
                 index=len(chunks) + 1,
-                files=tuple(dict.fromkeys(current_files)),
+                files=unique_files,
                 text="".join(current_parts),
             )
         )
@@ -194,8 +231,17 @@ def build_review_chunks(
         current_bytes = 0
 
     for path in actual_files:
+        # Keep every raw shard file-local. This lets the next hierarchy stage synthesize
+        # all pieces of one file before global cross-file reasoning.
+        flush()
         display_path = _display_path(path)
-        diff = _file_diff(repo, cwd, base, path)
+        binary = _is_binary_change(repo, cwd, base, path)
+        if binary and not allow_binary:
+            raise YoloError(
+                f"binary change cannot be semantically reviewed: {display_path}; "
+                "set engine.final_review_allow_binary=true only when metadata-only review is acceptable"
+            )
+        diff = _binary_metadata(repo, cwd, base, path) if binary else _file_diff(repo, cwd, base, path)
         diff_bytes = len(diff.encode("utf-8"))
         total_bytes += diff_bytes
         if total_bytes > MAX_TOTAL_REVIEW_DIFF_BYTES:
@@ -217,13 +263,7 @@ def build_review_chunks(
             )
             payload = header + piece
             payload_bytes = len(payload.encode("utf-8"))
-            if (
-                current_parts
-                and (
-                    current_bytes + payload_bytes > chunk_bytes
-                    or len(set(current_files + [display_path])) > chunk_files
-                )
-            ):
+            if current_parts and current_bytes + payload_bytes > chunk_bytes:
                 flush()
             if payload_bytes > chunk_bytes:
                 raise YoloError(
@@ -232,5 +272,5 @@ def build_review_chunks(
             current_parts.append(payload)
             current_files.append(display_path)
             current_bytes += payload_bytes
-    flush()
+        flush()
     return manifest, chunks
