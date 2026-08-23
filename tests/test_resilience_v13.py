@@ -41,11 +41,18 @@ from omarchy_yolo.sandbox import Sandbox
 from omarchy_yolo.util import YoloError, atomic_to_thread
 
 
-def _surviving_descendant_leader_code() -> str:
+def _surviving_descendant_leader_code(
+    *, descendant_exits_on_term: bool = True
+) -> str:
+    term_action = (
+        "(marker.write_text('terminated'), sys.exit(0))"
+        if descendant_exits_on_term
+        else "marker.write_text('terminated')"
+    )
     child_code = (
         "import pathlib, signal, sys, time; "
         "marker = pathlib.Path(sys.argv[1]); "
-        "signal.signal(signal.SIGTERM, lambda *_: (marker.write_text('terminated'), sys.exit(0))); "
+        f"signal.signal(signal.SIGTERM, lambda *_: {term_action}); "
         "pathlib.Path(str(marker) + '.ready').write_text('ready'); "
         "print('child-ready', flush=True); time.sleep(30)"
     )
@@ -947,7 +954,7 @@ async def test_agent_and_gate_runners_terminate_surviving_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     leader_code = (
-        _surviving_descendant_leader_code()
+        _surviving_descendant_leader_code(descendant_exits_on_term=False)
         + "import signal\n"
         + "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
         + "time.sleep(30)\n"
