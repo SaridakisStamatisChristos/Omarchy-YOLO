@@ -13,6 +13,7 @@ from .util import YoloError, xdg_config_home, xdg_state_home
 @dataclass(slots=True)
 class EngineConfig:
     max_parallel: int = 4
+    max_global_workers: int = 4
     max_attempts: int = 3
     max_final_cycles: int = 2
     max_tasks: int = 12
@@ -25,6 +26,9 @@ class EngineConfig:
     auto_apply: bool = False
     cleanup_worktrees: bool = True
     execution_profile: str = "yolo-worktree"
+    final_review_chunk_bytes: int = 60_000
+    final_review_chunk_files: int = 8
+    final_review_max_files: int = 512
 
 
 @dataclass(slots=True)
@@ -46,12 +50,14 @@ class SandboxConfig:
     backend: str = "native"
     network: bool = True
     read_only_home: bool = False
+    writable_home_paths: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
 class AgentConfig:
     enabled: bool = True
     command: tuple[str, ...] = ()
+    review_command: tuple[str, ...] = ()
 
 
 DEFAULT_AGENT_COMMANDS: dict[str, tuple[str, ...]] = {
@@ -145,6 +151,17 @@ def _branch_prefix(value: Any) -> str:
     return prefix
 
 
+def _writable_home_paths(value: Any) -> tuple[str, ...]:
+    paths = _tuple_str(value)
+    clean: list[str] = []
+    for raw in paths:
+        candidate = raw.strip().strip("/")
+        if not candidate or candidate in {".", ".."} or candidate.startswith("../") or "/../" in candidate:
+            raise YoloError("sandbox.writable_home_paths must contain relative paths inside HOME")
+        clean.append(candidate)
+    return tuple(clean)
+
+
 def load_config(path: Path | None = None) -> Config:
     config_path = path or Path(
         os.environ.get("OMARCHY_YOLO_CONFIG", xdg_config_home() / "omarchy-yolo/config.toml")
@@ -164,6 +181,13 @@ def load_config(path: Path | None = None) -> Config:
         raise YoloError("engine.execution_profile must be 'yolo-worktree' or 'danger-yolo'")
     engine = EngineConfig(
         max_parallel=_bounded_int(e.get("max_parallel", 4), default=4, minimum=1, maximum=64, name="engine.max_parallel"),
+        max_global_workers=_bounded_int(
+            e.get("max_global_workers", 4),
+            default=4,
+            minimum=1,
+            maximum=128,
+            name="engine.max_global_workers",
+        ),
         max_attempts=_bounded_int(e.get("max_attempts", 3), default=3, minimum=1, maximum=20, name="engine.max_attempts"),
         max_final_cycles=_bounded_int(e.get("max_final_cycles", 2), default=2, minimum=0, maximum=20, name="engine.max_final_cycles"),
         max_tasks=_bounded_int(e.get("max_tasks", 12), default=12, minimum=1, maximum=256, name="engine.max_tasks"),
@@ -180,6 +204,27 @@ def load_config(path: Path | None = None) -> Config:
         auto_apply=_strict_bool(e.get("auto_apply"), default=False, name="engine.auto_apply"),
         cleanup_worktrees=_strict_bool(e.get("cleanup_worktrees"), default=True, name="engine.cleanup_worktrees"),
         execution_profile=execution_profile,
+        final_review_chunk_bytes=_bounded_int(
+            e.get("final_review_chunk_bytes", 60_000),
+            default=60_000,
+            minimum=8_000,
+            maximum=120_000,
+            name="engine.final_review_chunk_bytes",
+        ),
+        final_review_chunk_files=_bounded_int(
+            e.get("final_review_chunk_files", 8),
+            default=8,
+            minimum=1,
+            maximum=64,
+            name="engine.final_review_chunk_files",
+        ),
+        final_review_max_files=_bounded_int(
+            e.get("final_review_max_files", 512),
+            default=512,
+            minimum=1,
+            maximum=4096,
+            name="engine.final_review_max_files",
+        ),
     )
 
     g = _section(data, "git")
@@ -204,6 +249,7 @@ def load_config(path: Path | None = None) -> Config:
         backend=backend,
         network=_strict_bool(s.get("network"), default=True, name="sandbox.network"),
         read_only_home=_strict_bool(s.get("read_only_home"), default=False, name="sandbox.read_only_home"),
+        writable_home_paths=_writable_home_paths(s.get("writable_home_paths")),
     )
 
     agents_section = _section(data, "agents")
@@ -215,6 +261,7 @@ def load_config(path: Path | None = None) -> Config:
         agents[name] = AgentConfig(
             enabled=_strict_bool(raw.get("enabled"), default=name != "gemini", name=f"agents.{name}.enabled"),
             command=_tuple_str(raw.get("command"), default_cmd),
+            review_command=_tuple_str(raw.get("review_command")),
         )
     for name, raw in agents_section.items():
         safe_name = _agent_name(name, field_name=f"agents.{name}")
@@ -225,6 +272,7 @@ def load_config(path: Path | None = None) -> Config:
                 raw.get("enabled"), default=True, name=f"agents.{safe_name}.enabled"
             ),
             command=_tuple_str(raw.get("command")),
+            review_command=_tuple_str(raw.get("review_command")),
         )
 
     return Config(
