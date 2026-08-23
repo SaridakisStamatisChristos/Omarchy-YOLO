@@ -15,11 +15,15 @@ worker_agents = ["codex", "claude", "opencode"]
 auto_apply = false
 cleanup_worktrees = true
 execution_profile = "yolo-worktree"
-# Final release audit is hierarchical and fail-closed: every changed file must fit
-# inside these reviewed limits or the job cannot be marked complete.
+# Final release audit is hierarchical and fail-closed: changed-file shards are
+# reviewed first, multi-shard files are semantically synthesized, then file-level
+# reports are synthesized across the release.
 final_review_chunk_bytes = 60000
 final_review_chunk_files = 8
 final_review_max_files = 512
+# Binary changes are rejected by default because semantic content cannot be
+# inspected. Set true only to explicitly permit metadata-only binary review.
+final_review_allow_binary = false
 
 [git]
 require_clean_repo = true
@@ -28,19 +32,22 @@ commit_name = "Omarchy YOLO"
 commit_email = "omarchy-yolo@localhost"
 
 [gates]
-# Empty means auto-detect from the repository.
+# Empty means auto-detect from the repository. Gate processes use the dedicated
+# gate sandbox profile when sandbox.backend = "bwrap": repository cwd remains
+# writable, while host filesystem/HOME are read-only and network follows the
+# sandbox.network policy.
 commands = []
 final_commands = []
 
 [sandbox]
 # native: use each agent's own non-interactive/full-auto mode.
-# bwrap: additionally wrap the agent process in bubblewrap.
+# bwrap: additionally wrap worker/reviewer/gate processes in Bubblewrap.
 # none: no external confinement; still runs as your normal user, never sudo.
 backend = "native"
 network = true
 # With bwrap, review/planning always sees HOME read-only. Worker mode can also
 # make HOME read-only and selectively re-enable only the credential/session dirs
-# required by a coding CLI.
+# required by a coding CLI. Gate mode does not inherit writable HOME exceptions.
 read_only_home = false
 writable_home_paths = []
 
