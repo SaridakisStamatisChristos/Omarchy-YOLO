@@ -4,17 +4,24 @@ import asyncio
 import json
 import os
 import re
-import signal
 import time
 from pathlib import Path
 
 from .model import GateResult
+from .process import _drain_process_pumps, _terminate_process_group
 from .sandbox import Sandbox
-from .util import YoloError, ensure_private_dir, open_private_binary, read_text_bounded
+from .util import (
+    YoloError,
+    ensure_private_dir,
+    finish_before_cancel,
+    open_private_binary,
+    read_text_bounded,
+)
 
 
 CAPTURE_LIMIT_BYTES = 200_000
 LOG_LIMIT_BYTES = 64_000_000
+_LOG_TRUNCATION_MARKER = b"\n[omarchy-yolo: gate log truncated]\n"
 
 
 def detect_gate_commands(repo: Path) -> tuple[str, ...]:
@@ -90,13 +97,22 @@ class GateRunner:
             nonlocal logged_bytes, log_truncated
             async with log_lock:
                 if logged_bytes < self.log_limit_bytes:
-                    payload = data[: self.log_limit_bytes - logged_bytes]
+                    remaining = self.log_limit_bytes - logged_bytes
+                    payload_budget = max(0, remaining - len(_LOG_TRUNCATION_MARKER))
+                    truncated_now = len(data) > payload_budget
+                    payload = data[:payload_budget]
                     with open_private_binary(log_path, append=True) as fh:
                         fh.write(payload)
                     logged_bytes += len(payload)
-                elif not log_truncated:
-                    with open_private_binary(log_path, append=True) as fh:
-                        fh.write(b"\n[omarchy-yolo: gate log truncated]\n")
+                    if truncated_now and not log_truncated:
+                        marker = _LOG_TRUNCATION_MARKER[
+                            : self.log_limit_bytes - logged_bytes
+                        ]
+                        with open_private_binary(log_path, append=True) as fh:
+                            fh.write(marker)
+                        logged_bytes += len(marker)
+                        log_truncated = True
+                else:
                     log_truncated = True
 
         async def pump(
@@ -129,7 +145,7 @@ class GateRunner:
                     cwd,
                     execution_profile="gate",
                 )
-                env = self.sandbox.environment()
+                env = self.sandbox.environment("gate")
             else:
                 env = os.environ.copy()
             env.setdefault("CI", "1")
@@ -156,13 +172,15 @@ class GateRunner:
                 await self._terminate_group(proc)
                 raise
             finally:
-                pump_results = list(
-                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                pump_results, drain_timed_out = await finish_before_cancel(
+                    _drain_process_pumps(proc, [stdout_task, stderr_task])
                 )
 
             for pump_result in pump_results:
                 if isinstance(pump_result, BaseException):
                     raise pump_result
+            if drain_timed_out:
+                raise YoloError("gate output pipes did not close after command exit")
 
             result = GateResult(
                 command=command,
@@ -182,19 +200,4 @@ class GateRunner:
 
     @staticmethod
     async def _terminate_group(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            return
-        except TimeoutError:
-            pass
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        await proc.wait()
+        await _terminate_process_group(proc)

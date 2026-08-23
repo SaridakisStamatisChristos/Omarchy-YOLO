@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_job_state ON tasks(job_id, state);
+CREATE INDEX IF NOT EXISTS idx_attempts_job_task ON attempts(job_id, task_id, number DESC);
 CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
@@ -174,4 +175,6 @@ class DatabaseCore:
             base_commit=str(row["base_commit"]),
             last_error=str(row["last_error"]),
             result_summary=str(row["result_summary"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
         )

@@ -24,10 +24,14 @@ def toggle_ui() -> bool:
     executable = shutil.which("omarchy-shell")
     if not executable:
         return False
-    proc = subprocess.run(
-        [executable, "dev.aether.yolo", "toggle"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        proc = subprocess.run(
+            [executable, "dev.aether.yolo", "toggle"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return False
     return proc.returncode == 0

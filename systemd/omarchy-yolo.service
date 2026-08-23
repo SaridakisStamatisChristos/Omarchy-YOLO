@@ -1,6 +1,6 @@
 [Unit]
 Description=Omarchy YOLO autonomous multi-agent orchestrator
-Documentation=https://github.com/basecamp/omarchy
+Documentation=https://github.com/SaridakisStamatisChristos/Omarchy-YOLO
 After=default.target
 
 [Service]
@@ -9,7 +9,9 @@ ExecStart=%h/.local/bin/yolo daemon
 Restart=on-failure
 RestartSec=2
 KillMode=mixed
-TimeoutStopSec=20
+# Cancellation waits for bounded Git topology mutations before releasing locks.
+# This exceeds the maximum configurable 900-second Git command timeout.
+TimeoutStopSec=16min
 NoNewPrivileges=true
 UMask=0077
 PrivateTmp=true

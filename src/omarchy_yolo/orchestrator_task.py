@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .git import GitRepo
-from .model import GateResult, ReviewResult, TaskRecord, TaskState
+from .model import AgentRole, GateResult, ReviewResult, TaskRecord, TaskState
 from .prompts import worker_prompt
 from .reviewer import format_gates
-from .util import YoloError, slug
+from .util import YoloError, atomic_to_thread, slug
 
 if TYPE_CHECKING:
     from .agents import AgentRegistry
@@ -70,16 +70,7 @@ class TaskExecutionMixin:
         branch_exists = False
         if task.branch:
             branch_exists = await asyncio.to_thread(repo.branch_exists, task.branch)
-        if (
-            stored_worktree is not None
-            and task.branch
-            and stored_worktree.exists()
-            and (stored_worktree / ".git").exists()
-        ):
-            worktree = stored_worktree
-            branch = task.branch
-            base_commit = task.base_commit
-        elif task.branch and branch_exists:
+        if task.branch and branch_exists:
             branch = task.branch
             base_commit = task.base_commit or await asyncio.to_thread(repo.head, integration_path)
             worktree = stored_worktree or (
@@ -87,7 +78,7 @@ class TaskExecutionMixin:
             )
             async with self._merge_lock:
                 async with self.coordinator.repo_lock(repo.root):
-                    await asyncio.to_thread(
+                    await atomic_to_thread(
                         repo.ensure_existing_branch_worktree, worktree, branch, base_commit
                     )
             self.db.update_task(task_id, worktree=str(worktree), base_commit=base_commit)
@@ -103,7 +94,7 @@ class TaskExecutionMixin:
                     base_commit = await asyncio.to_thread(repo.head, integration_path)
                     branch = f"{self.config.git.branch_prefix}/{job_id}/{slug(task.logical_id)}"
                     worktree = self.config.worktrees_dir / job_id / f"task-{task.seq}-{slug(task.logical_id)}"
-                    await asyncio.to_thread(repo.ensure_worktree, worktree, branch, base_commit)
+                    await atomic_to_thread(repo.ensure_worktree, worktree, branch, base_commit)
             self.db.update_task(
                 task_id,
                 branch=branch,
@@ -186,7 +177,7 @@ class TaskExecutionMixin:
                 )
                 continue
 
-            await asyncio.to_thread(
+            await atomic_to_thread(
                 repo.commit_all,
                 worktree,
                 f"yolo({task.logical_id}): {task.title}",
@@ -269,8 +260,16 @@ class TaskExecutionMixin:
             if self.config.engine.cleanup_worktrees:
                 try:
                     async with self.coordinator.repo_lock(repo.root):
-                        await asyncio.to_thread(repo.remove_worktree, worktree, force=True)
-                        await asyncio.to_thread(repo.delete_branch, branch)
+                        await atomic_to_thread(repo.remove_worktree, worktree, force=True)
+                        await atomic_to_thread(repo.delete_branch, branch)
+                except asyncio.CancelledError:
+                    self.db.event(
+                        job_id,
+                        "task.cleanup_interrupted",
+                        {"branch": branch, "path": str(worktree)},
+                        task_id=task_id,
+                    )
+                    raise
                 except Exception as exc:
                     # Integration success is durable correctness; worktree deletion is
                     # housekeeping and must never retroactively fail an accepted task.
@@ -294,17 +293,19 @@ class TaskExecutionMixin:
     def _choose_worker(self, task: TaskRecord, attempt_number: int) -> str:
         if task.preferred_agent:
             try:
-                if self.registry.get(task.preferred_agent).available():
+                if task.preferred_agent in self.registry.available(role=AgentRole.WORKER):
                     return task.preferred_agent
             except YoloError:
                 pass
         available = [
             name
             for name in self.config.engine.worker_agents
-            if name in self.registry.available()
+            if name in self.registry.available(role=AgentRole.WORKER)
         ]
         if not available:
-            return self.registry.first_available(self.config.engine.worker_agents)
+            return self.registry.first_available(
+                self.config.engine.worker_agents, role=AgentRole.WORKER
+            )
         index = (task.seq + attempt_number - 2) % len(available)
         return available[index]
 
@@ -327,7 +328,7 @@ class TaskExecutionMixin:
                 agent_name = self.registry.choose_role(
                     candidate,
                     self.config.engine.worker_agents,
-                    execution_profile="review",
+                    role=AgentRole.REVIEWER,
                 )
                 if agent_name in actual_tried:
                     continue

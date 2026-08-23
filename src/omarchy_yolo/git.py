@@ -4,8 +4,11 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from .config import GitConfig
 from .util import YoloError, ensure_private_dir
@@ -16,6 +19,17 @@ class CommandOutput:
     returncode: int
     stdout: str
     stderr: str
+    timed_out: bool = False
+    output_truncated: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class BinaryCommandOutput:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+    output_truncated: bool = False
 
 
 class GitError(YoloError):
@@ -26,21 +40,310 @@ class MergeConflict(GitError):
     pass
 
 
+DEFAULT_GIT_COMMAND_TIMEOUT_SECONDS = 120
+MAX_GIT_STDOUT_BYTES = 2_000_000
+MAX_GIT_STDERR_BYTES = 256_000
+_GIT_TERMINATION_GRACE_SECONDS = 2.0
+
+
 class GitRepo:
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        command_timeout_seconds: int = DEFAULT_GIT_COMMAND_TIMEOUT_SECONDS,
+        allow_repository_commands: bool = True,
+    ):
         self.root = root.resolve()
+        self.command_timeout_seconds = max(1, command_timeout_seconds)
+        self.allow_repository_commands = allow_repository_commands
 
     @classmethod
-    def discover(cls, path: Path) -> "GitRepo":
-        out = cls._run_static(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
+    def discover(
+        cls,
+        path: Path,
+        *,
+        command_timeout_seconds: int = DEFAULT_GIT_COMMAND_TIMEOUT_SECONDS,
+        allow_repository_commands: bool = True,
+    ) -> "GitRepo":
+        out = cls._run_static(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            timeout_seconds=command_timeout_seconds,
+        )
+        if out.timed_out:
+            raise GitError(f"Git repository discovery timed out after {command_timeout_seconds}s")
+        if out.output_truncated:
+            raise GitError("Git repository discovery produced oversized output")
         if out.returncode != 0:
             raise GitError(f"not a Git repository: {path}: {out.stderr.strip()}")
-        return cls(Path(out.stdout.strip()))
+        return cls(
+            Path(out.stdout.strip()),
+            command_timeout_seconds=command_timeout_seconds,
+            allow_repository_commands=allow_repository_commands,
+        )
 
     @staticmethod
-    def _run_static(argv: list[str], *, env: dict[str, str] | None = None) -> CommandOutput:
-        proc = subprocess.run(argv, text=True, capture_output=True, env=env, check=False)
-        return CommandOutput(proc.returncode, proc.stdout, proc.stderr)
+    def _base_environment(env: dict[str, str] | None = None) -> dict[str, str]:
+        effective = os.environ.copy() if env is None else dict(env)
+        identity = {
+            key: value
+            for key, value in effective.items()
+            if key
+            in {
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+            }
+        }
+        for key in tuple(effective):
+            if key.startswith("GIT_"):
+                effective.pop(key, None)
+        effective.update(identity)
+        # Control-plane Git never needs prompts, pagers, user aliases, global filters,
+        # or system configuration. Repository-local config remains available, with
+        # command-bearing entries neutralized in hostile-repository mode below.
+        effective["GIT_PAGER"] = "cat"
+        effective["GIT_TERMINAL_PROMPT"] = "0"
+        effective["GIT_ASKPASS"] = "/bin/false"
+        effective["SSH_ASKPASS"] = "/bin/false"
+        effective["GIT_CONFIG_NOSYSTEM"] = "1"
+        effective["GIT_CONFIG_GLOBAL"] = os.devnull
+        return effective
+
+    @staticmethod
+    def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + _GIT_TERMINATION_GRACE_SECONDS
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=_GIT_TERMINATION_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.01)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        if proc.poll() is None:
+            proc.wait()
+
+    @classmethod
+    def _run_static_bytes(
+        cls,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = DEFAULT_GIT_COMMAND_TIMEOUT_SECONDS,
+        max_stdout_bytes: int = MAX_GIT_STDOUT_BYTES,
+        max_stderr_bytes: int = MAX_GIT_STDERR_BYTES,
+    ) -> BinaryCommandOutput:
+        if timeout_seconds <= 0:
+            raise ValueError("Git command timeout must be positive")
+        if max_stdout_bytes < 1 or max_stderr_bytes < 1:
+            raise ValueError("Git output limits must be positive")
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=cls._base_environment(env),
+            start_new_session=True,
+        )
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        stdout = bytearray()
+        stderr = bytearray()
+        output_truncated = threading.Event()
+        buffer_lock = threading.Lock()
+        pump_errors: list[BaseException] = []
+
+        def pump(stream: BinaryIO, target: bytearray, limit: int) -> None:
+            try:
+                while True:
+                    chunk = stream.read(65_536)
+                    if not chunk:
+                        return
+                    with buffer_lock:
+                        remaining = max(0, limit - len(target))
+                        target.extend(chunk[:remaining])
+                        overflow = len(chunk) > remaining
+                    if overflow:
+                        output_truncated.set()
+                        cls._terminate_process_group(proc)
+                        return
+            except BaseException as exc:
+                with buffer_lock:
+                    pump_errors.append(exc)
+                cls._terminate_process_group(proc)
+
+        stdout_thread = threading.Thread(
+            target=pump,
+            args=(proc.stdout, stdout, max_stdout_bytes),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=pump,
+            args=(proc.stderr, stderr, max_stderr_bytes),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            cls._terminate_process_group(proc)
+        finally:
+            stdout_thread.join(timeout=_GIT_TERMINATION_GRACE_SECONDS)
+            stderr_thread.join(timeout=_GIT_TERMINATION_GRACE_SECONDS)
+            if stdout_thread.is_alive() or stderr_thread.is_alive():
+                cls._terminate_process_group(proc)
+                proc.stdout.close()
+                proc.stderr.close()
+                stdout_thread.join(timeout=_GIT_TERMINATION_GRACE_SECONDS)
+                stderr_thread.join(timeout=_GIT_TERMINATION_GRACE_SECONDS)
+
+        if pump_errors and not timed_out:
+            raise GitError(
+                f"cannot capture bounded Git output: {type(pump_errors[0]).__name__}"
+            )
+
+        return BinaryCommandOutput(
+            proc.returncode if proc.returncode is not None else 124,
+            bytes(stdout),
+            bytes(stderr),
+            timed_out,
+            output_truncated.is_set(),
+        )
+
+    @classmethod
+    def _run_static(
+        cls,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = DEFAULT_GIT_COMMAND_TIMEOUT_SECONDS,
+        max_stdout_bytes: int = MAX_GIT_STDOUT_BYTES,
+        max_stderr_bytes: int = MAX_GIT_STDERR_BYTES,
+    ) -> CommandOutput:
+        out = cls._run_static_bytes(
+            argv,
+            env=env,
+            timeout_seconds=timeout_seconds,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+        return CommandOutput(
+            out.returncode,
+            out.stdout.decode("utf-8", errors="replace"),
+            out.stderr.decode("utf-8", errors="replace"),
+            out.timed_out,
+            out.output_truncated,
+        )
+
+    def _repository_command_overrides(self, directory: Path) -> list[str]:
+        if self.allow_repository_commands:
+            return []
+        pattern = r"^(filter\..*\.(clean|smudge|process|required)|merge\..*\.driver)$"
+        out = self._run_static_bytes(
+            [
+                "git",
+                "-C",
+                str(directory),
+                "config",
+                "--includes",
+                "--name-only",
+                "--null",
+                "--get-regexp",
+                pattern,
+            ],
+            timeout_seconds=self.command_timeout_seconds,
+            max_stdout_bytes=256_000,
+            max_stderr_bytes=64_000,
+        )
+        if out.timed_out:
+            raise GitError("timed out while inspecting repository command configuration")
+        if out.output_truncated:
+            raise GitError("repository command configuration exceeds the safety ceiling")
+        if out.returncode not in {0, 1}:
+            detail = out.stderr.decode("utf-8", errors="replace").strip()
+            raise GitError(f"cannot inspect repository command configuration: {detail}")
+        overrides: list[str] = []
+        for raw_key in out.stdout.split(b"\0"):
+            if not raw_key:
+                continue
+            key = os.fsdecode(raw_key)
+            lower = key.lower()
+            if lower.startswith("filter.") and lower.endswith((".clean", ".smudge")):
+                value = "/usr/bin/cat"
+            elif lower.startswith("filter.") and lower.endswith(".process"):
+                value = ""
+            elif lower.startswith("filter.") and lower.endswith(".required"):
+                value = "false"
+            elif lower.startswith("merge.") and lower.endswith(".driver"):
+                value = "/usr/bin/false"
+            else:
+                continue
+            overrides.extend(["-c", f"{key}={value}"])
+        return overrides
+
+    def run_bytes(
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+        max_stdout_bytes: int = MAX_GIT_STDOUT_BYTES,
+        max_stderr_bytes: int = MAX_GIT_STDERR_BYTES,
+    ) -> BinaryCommandOutput:
+        directory = (cwd or self.root).resolve()
+        argv = [
+            "git",
+            "-C",
+            str(directory),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "interactive.diffFilter=",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.quotePath=true",
+            *self._repository_command_overrides(directory),
+            *args,
+        ]
+        out = self._run_static_bytes(
+            argv,
+            env=env,
+            timeout_seconds=self.command_timeout_seconds,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+        command = " ".join(args[:8])
+        if check and out.timed_out:
+            raise GitError(
+                f"git {command} timed out after {self.command_timeout_seconds} seconds"
+            )
+        if check and out.output_truncated:
+            raise GitError(f"git {command} exceeded the bounded output limit")
+        if check and out.returncode != 0:
+            detail = out.stderr.decode("utf-8", errors="replace").strip()
+            raise GitError(f"git {command} failed: {detail}")
+        return out
 
     def run(
         self,
@@ -49,28 +352,19 @@ class GitRepo:
         check: bool = True,
         env: dict[str, str] | None = None,
     ) -> CommandOutput:
-        directory = cwd or self.root
-        effective_env = os.environ.copy() if env is None else dict(env)
-        effective_env.setdefault("GIT_PAGER", "cat")
-        effective_env.setdefault("GIT_TERMINAL_PROMPT", "0")
-        out = self._run_static(
-            [
-                "git",
-                "-C",
-                str(directory),
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "diff.external=",
-                *args,
-            ],
-            env=effective_env,
+        out = self.run_bytes(
+            *args,
+            cwd=cwd,
+            check=check,
+            env=env,
         )
-        if check and out.returncode != 0:
-            raise GitError(f"git {' '.join(args)} failed: {out.stderr.strip()}")
-        return out
+        return CommandOutput(
+            out.returncode,
+            out.stdout.decode("utf-8", errors="replace"),
+            out.stderr.decode("utf-8", errors="replace"),
+            out.timed_out,
+            out.output_truncated,
+        )
 
     def _run_stdout_bounded(
         self,
@@ -79,45 +373,22 @@ class GitRepo:
         cwd: Path,
         max_bytes: int,
     ) -> tuple[str, bool]:
-        argv = [
-            "git",
-            "-C",
-            str(cwd),
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "diff.external=",
+        out = self.run_bytes(
             *args,
-        ]
-        env = os.environ.copy()
-        env.setdefault("GIT_PAGER", "cat")
-        env.setdefault("GIT_TERMINAL_PROMPT", "0")
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
+            cwd=cwd,
+            check=False,
+            max_stdout_bytes=max_bytes,
+            max_stderr_bytes=64_000,
         )
-        assert proc.stdout is not None
-        data = proc.stdout.read(max_bytes + 1)
-        truncated = len(data) > max_bytes
-        if truncated and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-        return data[:max_bytes].decode("utf-8", errors="replace"), truncated
+        command = " ".join(args[:8])
+        if out.timed_out:
+            raise GitError(
+                f"git {command} timed out after {self.command_timeout_seconds} seconds"
+            )
+        if out.returncode != 0 and not out.output_truncated:
+            detail = out.stderr.decode("utf-8", errors="replace").strip()
+            raise GitError(f"git {command} failed: {detail}")
+        return out.stdout.decode("utf-8", errors="replace"), out.output_truncated
 
     def _common_dir(self, cwd: Path) -> Path:
         out = self.run("rev-parse", "--git-common-dir", cwd=cwd)
@@ -131,8 +402,16 @@ class GitRepo:
 
     def assert_worktree(self, path: Path, expected_branch: str | None = None) -> None:
         resolved = path.resolve()
-        out = self._run_static(["git", "-C", str(resolved), "rev-parse", "--show-toplevel"])
-        if out.returncode != 0 or Path(out.stdout.strip()).resolve() != resolved:
+        out = self._run_static(
+            ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
+            timeout_seconds=self.command_timeout_seconds,
+        )
+        if (
+            out.timed_out
+            or out.output_truncated
+            or out.returncode != 0
+            or Path(out.stdout.strip()).resolve() != resolved
+        ):
             raise GitError(f"refusing path that is not a Git worktree root: {path}")
         if self._common_dir(resolved) != self._root_common_dir():
             raise GitError(f"refusing worktree belonging to a different repository: {path}")
@@ -151,7 +430,13 @@ class GitRepo:
 
     def branch(self, cwd: Path | None = None) -> str:
         out = self.run("symbolic-ref", "--quiet", "--short", "HEAD", cwd=cwd, check=False)
-        return out.stdout.strip() if out.returncode == 0 else "HEAD"
+        if out.timed_out or out.output_truncated:
+            raise GitError("cannot determine current branch within bounded Git limits")
+        if out.returncode == 0:
+            return out.stdout.strip()
+        if out.returncode == 1:
+            return "HEAD"
+        raise GitError(f"cannot determine current branch: {out.stderr.strip()}")
 
     def is_clean(self, cwd: Path | None = None) -> bool:
         return not self.run("status", "--porcelain=v1", cwd=cwd).stdout.strip()
@@ -163,9 +448,14 @@ class GitRepo:
 
     def branch_exists(self, branch: str) -> bool:
         self._validate_branch_name(branch)
-        return self.run(
+        out = self.run(
             "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False
-        ).returncode == 0
+        )
+        if out.timed_out or out.output_truncated:
+            raise GitError("cannot determine branch existence within bounded Git limits")
+        if out.returncode not in {0, 1}:
+            raise GitError(f"cannot inspect branch {branch}: {out.stderr.strip()}")
+        return out.returncode == 0
 
     def ensure_worktree(self, path: Path, branch: str, ref: str) -> None:
         self._validate_branch_name(branch)
@@ -190,7 +480,7 @@ class GitRepo:
                 self.assert_worktree(path, branch)
                 return
             raise GitError(f"refusing to delete unrelated directory at worktree path: {path}")
-        self.run("worktree", "prune", check=False)
+        self.run("worktree", "prune")
         if not self.branch_exists(branch):
             self.run("branch", "--", branch, ref)
         self.run("worktree", "add", str(path), branch)
@@ -198,7 +488,7 @@ class GitRepo:
 
     def remove_worktree(self, path: Path, *, force: bool = True) -> None:
         if not path.exists() and not path.is_symlink():
-            self.run("worktree", "prune", check=False)
+            self.run("worktree", "prune")
             return
         if path.is_symlink():
             raise GitError(f"refusing symlink at worktree path: {path}")
@@ -208,22 +498,25 @@ class GitRepo:
             args.append("--force")
         args.extend(["--", str(path)])
         out = self.run(*args, check=False)
+        if out.timed_out:
+            raise GitError(
+                f"worktree removal timed out after {self.command_timeout_seconds} seconds"
+            )
+        if out.output_truncated:
+            raise GitError("worktree removal produced oversized output")
         if out.returncode != 0:
             # Only fall back after proving this directory belongs to this repository.
             self.assert_worktree(path)
             shutil.rmtree(path)
-            self.run("worktree", "prune", check=False)
+            self.run("worktree", "prune")
 
     def delete_branch(self, branch: str) -> None:
         self._validate_branch_name(branch)
         if self.branch_exists(branch):
-            self.run("branch", "-D", "--", branch, check=False)
+            self.run("branch", "-D", "--", branch)
 
-    def commit_all(self, cwd: Path, message: str, cfg: GitConfig) -> str:
-        self.assert_worktree(cwd)
-        if self.is_clean(cwd):
-            return self.head(cwd)
-        self.run("add", "-A", cwd=cwd)
+    @staticmethod
+    def _identity_environment(cfg: GitConfig) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
             {
@@ -233,6 +526,13 @@ class GitRepo:
                 "GIT_COMMITTER_EMAIL": cfg.commit_email,
             }
         )
+        return env
+
+    def commit_all(self, cwd: Path, message: str, cfg: GitConfig) -> str:
+        self.assert_worktree(cwd)
+        if self.is_clean(cwd):
+            return self.head(cwd)
+        self.run("add", "-A", cwd=cwd)
         self.run(
             "-c",
             "core.hooksPath=/dev/null",
@@ -241,7 +541,7 @@ class GitRepo:
             "-m",
             message,
             cwd=cwd,
-            env=env,
+            env=self._identity_environment(cfg),
         )
         return self.head(cwd)
 
@@ -273,10 +573,15 @@ class GitRepo:
 
     def changed_files(self, cwd: Path, base: str) -> list[str]:
         self.assert_worktree(cwd)
-        out = self.run("diff", "--name-only", f"{base}..HEAD", cwd=cwd, check=False).stdout
-        return [line for line in out.splitlines() if line.strip()]
+        out = self.run_bytes("diff", "--name-only", "-z", f"{base}..HEAD", cwd=cwd).stdout
+        return [os.fsdecode(item) for item in out.split(b"\0") if item]
 
-    def merge(self, integration_cwd: Path, branch: str) -> None:
+    def merge(
+        self,
+        integration_cwd: Path,
+        branch: str,
+        cfg: GitConfig | None = None,
+    ) -> None:
         self.assert_worktree(integration_cwd)
         self._validate_branch_name(branch)
         out = self.run(
@@ -285,11 +590,19 @@ class GitRepo:
             "merge",
             "--no-ff",
             "--no-edit",
+            "--no-gpg-sign",
             "--",
             branch,
             cwd=integration_cwd,
             check=False,
+            env=self._identity_environment(cfg or GitConfig()),
         )
+        if out.timed_out:
+            raise GitError(
+                f"integration merge timed out after {self.command_timeout_seconds} seconds"
+            )
+        if out.output_truncated:
+            raise GitError("integration merge produced oversized output")
         if out.returncode != 0:
             unresolved = self.unresolved_files(integration_cwd)
             if unresolved:
@@ -298,8 +611,10 @@ class GitRepo:
 
     def unresolved_files(self, cwd: Path) -> list[str]:
         self.assert_worktree(cwd)
-        out = self.run("diff", "--name-only", "--diff-filter=U", cwd=cwd, check=False).stdout
-        return [line for line in out.splitlines() if line.strip()]
+        out = self.run_bytes(
+            "diff", "--name-only", "--diff-filter=U", "-z", cwd=cwd
+        ).stdout
+        return [os.fsdecode(item) for item in out.split(b"\0") if item]
 
     def merge_in_progress(self, cwd: Path) -> bool:
         self.assert_worktree(cwd)
@@ -316,15 +631,6 @@ class GitRepo:
             raise MergeConflict("unresolved merge files remain: " + ", ".join(unresolved))
         self.run("add", "-A", cwd=cwd)
         if self.merge_in_progress(cwd):
-            env = os.environ.copy()
-            env.update(
-                {
-                    "GIT_AUTHOR_NAME": cfg.commit_name,
-                    "GIT_AUTHOR_EMAIL": cfg.commit_email,
-                    "GIT_COMMITTER_NAME": cfg.commit_name,
-                    "GIT_COMMITTER_EMAIL": cfg.commit_email,
-                }
-            )
             self.run(
                 "-c",
                 "core.hooksPath=/dev/null",
@@ -332,7 +638,7 @@ class GitRepo:
                 "--no-gpg-sign",
                 "--no-edit",
                 cwd=cwd,
-                env=env,
+                env=self._identity_environment(cfg),
             )
         elif not self.is_clean(cwd):
             self.commit_all(cwd, "yolo: resolve integration", cfg)
@@ -340,12 +646,12 @@ class GitRepo:
     def abort_merge(self, cwd: Path) -> None:
         self.assert_worktree(cwd)
         if self.merge_in_progress(cwd):
-            self.run("merge", "--abort", cwd=cwd, check=False)
+            self.run("merge", "--abort", cwd=cwd)
 
     def reset_hard(self, cwd: Path, commit: str) -> None:
         self.assert_worktree(cwd)
         self.run("reset", "--hard", commit, cwd=cwd)
-        self.run("clean", "-ffdx", cwd=cwd, check=False)
+        self.run("clean", "-ffdx", cwd=cwd)
 
     def can_fast_forward_source(self, base_branch: str, base_commit: str) -> tuple[bool, str]:
         if base_branch == "HEAD":

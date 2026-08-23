@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from pathlib import Path
@@ -38,7 +39,7 @@ async def rpc_call(socket_path: Path, method: str, params: dict[str, Any] | None
         if len(encoded) > MAX_RPC_MESSAGE_BYTES:
             raise RpcError("RPC request exceeds the maximum message size")
         writer.write(encoded)
-        await writer.drain()
+        await asyncio.wait_for(writer.drain(), timeout=30)
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=30)
         except ValueError as exc:
@@ -60,4 +61,5 @@ async def rpc_call(socket_path: Path, method: str, params: dict[str, Any] | None
         return response.get("result")
     finally:
         writer.close()
-        await writer.wait_closed()
+        with contextlib.suppress(OSError, TimeoutError):
+            await asyncio.wait_for(writer.wait_closed(), timeout=5)

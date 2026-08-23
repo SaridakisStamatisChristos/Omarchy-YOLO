@@ -65,9 +65,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for state transitions and recov
 - Serialized integration with automatic conflict-repair agent cycles.
 - Post-merge verification and rollback if integration damages the candidate branch.
 - Crash recovery: interrupted workers become schedulable again; in-flight attempts are preserved as cancelled.
+- Cancellation-safe, timeout-bounded Git topology mutations with deterministic integration rollback.
 - Explicit stop/resume with a fresh retry budget while preserving monotonic attempt numbers.
-- Optional Bubblewrap outer sandbox.
-- Omarchy Quickshell bar widget with live task graph, progress, stop, resume, and IPC controls.
+- Optional Bubblewrap outer sandbox, including a stricter hostile-repository gate profile.
+- Formal per-agent worker/planner/reviewer/integrator capability contracts.
+- Durable scheduler, attempt, timing, wait, utilization, and recovery telemetry.
+- Omarchy Quickshell bar widget with live task graph, capacity, attempt/event telemetry, stop, resume, and IPC controls.
 - systemd user service; daemon refuses UID 0.
 - Optional safe auto-apply via `git merge --ff-only` only when the source worktree is unchanged and clean.
 
@@ -183,6 +186,30 @@ read_only_home = false
 
 See [SECURITY.md](SECURITY.md) for the exact trust boundaries and the stricter `read_only_home` option.
 
+### Hostile repository mode
+
+For a repository whose tracked files and gate commands are not trusted, enable the stricter local boundary:
+
+```toml
+[sandbox]
+backend = "bwrap"
+hostile_repo_mode = true
+network = false
+gate_env_allowlist = []
+agent_env_allowlist = []
+writable_home_paths = []
+
+[git]
+allow_repository_commands = false
+```
+
+This mode is deliberately opt-in. All child profiles receive a fresh HOME/runtime view and filtered environment.
+Only `writable_home_paths` are re-exposed to agents (writable for workers/integrators, read-only for
+planners/reviewers); gates receive no HOME exceptions and no network. Control-plane Git neutralizes configured
+clean/smudge/process filters and merge drivers. Agent network follows `sandbox.network`, because remote model CLIs
+may require it. A disposable VM remains the appropriate boundary for code that may exploit the kernel or an allowed
+agent CLI.
+
 ## Configuration
 
 Copy/edit `config.example.toml` or the installer-created `~/.config/omarchy-yolo/config.toml`.
@@ -200,6 +227,10 @@ worker_agents = ["codex", "claude", "opencode"]
 auto_apply = false
 cleanup_worktrees = true
 execution_profile = "yolo-worktree"
+
+[git]
+command_timeout_seconds = 120
+allow_repository_commands = true
 
 [gates]
 # Empty arrays mean auto-detect from the repository.
@@ -221,7 +252,17 @@ command = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", 
 
 A custom CLI can be added as another `[agents.NAME]` table if it accepts the prompt as its final argument and
 returns useful stdout. Structured planner/reviewer roles must return the JSON contract described in
-`src/omarchy_yolo/prompts.py`.
+`src/omarchy_yolo/prompts.py`. An optional `roles` allowlist makes the capability boundary explicit:
+
+```toml
+[agents.local]
+command = ["my-agent", "--write"]
+review_command = ["my-agent", "--read-only"]
+roles = ["worker", "planner", "reviewer", "integrator"]
+```
+
+A dedicated review-only adapter may omit `command` and declare only `review_command` plus planner/reviewer roles.
+`yolo doctor` fails if no available adapter satisfies a role required by the pipeline.
 
 ## Gates
 
@@ -254,7 +295,8 @@ The daemon persists every job, task, attempt, and event. On restart:
 6. a resumed failed task receives a fresh configured attempt budget with monotonic attempt numbers.
 
 This is deliberately **at-least-once task execution**, with Git commits/worktrees providing the practical
-idempotency boundary.
+idempotency boundary. Cancellation cannot release a repository lock until a blocking Git mutation has terminated;
+an interrupted integration transaction is rolled back before durable task state becomes schedulable again.
 
 ## Omarchy shell integration
 
@@ -265,7 +307,9 @@ The plugin is a normal third-party Omarchy shell plugin. It does not patch `omar
 - IPC target: `dev.aether.yolo`
 - Toggle from CLI: `yolo ui`
 
-The widget polls the daemon through `yolo status --json`, shows the current task graph, and exposes stop/resume.
+The widget polls the daemon through `yolo status --json`, shows the current task graph, active review/integration
+work, scheduler capacity/waiters, attempt durations, state age, failures and the latest durable event, and exposes
+stop/resume.
 The daemon remains independent of the UI; closing the panel or terminal does not terminate jobs.
 
 ## Development

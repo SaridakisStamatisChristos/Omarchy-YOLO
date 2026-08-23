@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
 
 from .gates import detect_gate_commands
 from .git import GitError, GitRepo, MergeConflict
-from .model import GateResult, ReviewResult, TaskRecord, TaskState
+from .model import AgentRole, GateResult, ReviewResult, TaskRecord, TaskState
 from .prompts import INTEGRATION_REPAIR_TEMPLATE
 from .review_source import build_review_chunks
 from .reviewer import format_gates
-from .util import YoloError
+from .util import YoloError, atomic_to_thread, finish_before_cancel
 
 if TYPE_CHECKING:
     from .agents import AgentRegistry
@@ -46,7 +46,12 @@ class IntegrationMixin:
                 pre_merge = await asyncio.to_thread(repo.head, integration_path)
                 try:
                     try:
-                        await asyncio.to_thread(repo.merge, integration_path, task.branch)
+                        await atomic_to_thread(
+                            repo.merge,
+                            integration_path,
+                            task.branch,
+                            self.config.git,
+                        )
                     except MergeConflict as exc:
                         self.db.event(
                             job_id,
@@ -58,7 +63,7 @@ class IntegrationMixin:
                             job_id, task, repo, integration_path, str(exc)
                         )
                         if not resolved:
-                            await asyncio.to_thread(repo.abort_merge, integration_path)
+                            await atomic_to_thread(repo.abort_merge, integration_path)
                             return False, "Integration merge conflict could not be resolved autonomously."
 
                     integration_gates = await self._run_gates(
@@ -80,7 +85,7 @@ class IntegrationMixin:
                                 suffix="integration-repair",
                             )
                         if not repaired or not all(result.ok for result in integration_gates):
-                            await asyncio.to_thread(repo.reset_hard, integration_path, pre_merge)
+                            await atomic_to_thread(repo.reset_hard, integration_path, pre_merge)
                             self.db.event(
                                 job_id,
                                 "integration.rolled_back",
@@ -99,10 +104,20 @@ class IntegrationMixin:
                         task_id=task.id,
                     )
                     return True, ""
-                except Exception:
-                    await asyncio.to_thread(repo.abort_merge, integration_path)
-                    if await asyncio.to_thread(repo.head, integration_path) != pre_merge:
-                        await asyncio.to_thread(repo.reset_hard, integration_path, pre_merge)
+                except BaseException:
+                    # Cancellation is not a commit boundary. Roll back the entire
+                    # integration transaction before the repository lock can be
+                    # released and durable task state is made schedulable again.
+                    async def rollback() -> None:
+                        try:
+                            await atomic_to_thread(repo.abort_merge, integration_path)
+                        except Exception:
+                            # A hard reset is the authoritative fallback and also
+                            # clears merge metadata when merge --abort itself fails.
+                            pass
+                        await atomic_to_thread(repo.reset_hard, integration_path, pre_merge)
+
+                    await finish_before_cancel(rollback())
                     raise
 
     async def _resolve_merge_conflict(
@@ -117,7 +132,9 @@ class IntegrationMixin:
             unresolved = await asyncio.to_thread(repo.unresolved_files, integration_path)
             if not unresolved:
                 try:
-                    await asyncio.to_thread(repo.finish_merge, integration_path, self.config.git)
+                    await atomic_to_thread(
+                        repo.finish_merge, integration_path, self.config.git
+                    )
                     return True
                 except GitError:
                     pass
@@ -127,7 +144,9 @@ class IntegrationMixin:
                 "Resolve the merge while preserving both the task intent and already integrated work."
             )
             agent_name = self.registry.choose_role(
-                self.config.engine.integrator_agent, self.config.engine.worker_agents
+                self.config.engine.integrator_agent,
+                self.config.engine.worker_agents,
+                role=AgentRole.INTEGRATOR,
             )
             log_path = (
                 self.config.logs_dir
@@ -147,7 +166,9 @@ class IntegrationMixin:
             )
             if result.ok:
                 try:
-                    await asyncio.to_thread(repo.finish_merge, integration_path, self.config.git)
+                    await atomic_to_thread(
+                        repo.finish_merge, integration_path, self.config.git
+                    )
                     if not await asyncio.to_thread(repo.unresolved_files, integration_path):
                         self.db.event(
                             job_id,
@@ -175,7 +196,9 @@ class IntegrationMixin:
                 break
             try:
                 agent_name = self.registry.choose_role(
-                    candidate, self.config.engine.worker_agents
+                    candidate,
+                    self.config.engine.worker_agents,
+                    role=AgentRole.INTEGRATOR,
                 )
                 if agent_name in actual_seen:
                     continue
@@ -198,7 +221,7 @@ class IntegrationMixin:
                 )
                 if not result.ok:
                     continue
-                await asyncio.to_thread(
+                await atomic_to_thread(
                     repo.commit_all,
                     integration_path,
                     "yolo: integration repair",
@@ -246,6 +269,18 @@ class IntegrationMixin:
                 "scope": label,
                 "commands": [result.command for result in results],
                 "ok": all(result.ok for result in results),
+                "duration_seconds": round(
+                    sum(result.duration_seconds for result in results), 3
+                ),
+                "results": [
+                    {
+                        "command": result.command,
+                        "returncode": result.returncode,
+                        "timed_out": result.timed_out,
+                        "duration_seconds": round(result.duration_seconds, 3),
+                    }
+                    for result in results
+                ],
             },
             task_id=task.id if task else None,
         )
@@ -433,7 +468,7 @@ class IntegrationMixin:
         reviewer_name = self.registry.choose_role(
             self.config.engine.reviewer_agent,
             self.config.engine.worker_agents,
-            execution_profile="review",
+            role=AgentRole.REVIEWER,
         )
         last_review = ReviewResult("retry", "not reviewed", ())
 
@@ -508,14 +543,14 @@ class IntegrationMixin:
                 if task.worktree:
                     worktree = Path(task.worktree)
                     if worktree.exists() or worktree.is_symlink():
-                        await asyncio.to_thread(repo.remove_worktree, worktree, force=True)
+                        await atomic_to_thread(repo.remove_worktree, worktree, force=True)
                 if task.branch:
-                    await asyncio.to_thread(repo.delete_branch, task.branch)
+                    await atomic_to_thread(repo.delete_branch, task.branch)
             if integration_path.exists() or integration_path.is_symlink():
-                await asyncio.to_thread(repo.remove_worktree, integration_path, force=True)
+                await atomic_to_thread(repo.remove_worktree, integration_path, force=True)
             root = self.config.worktrees_dir / job_id
             if root.exists():
-                shutil.rmtree(root, ignore_errors=True)
+                await atomic_to_thread(shutil.rmtree, root, ignore_errors=True)
 
     async def _cancel_active(self) -> None:
         active = [task for task in self._active if not task.done()]

@@ -38,6 +38,8 @@ class GitConfig:
     branch_prefix: str = "yolo"
     commit_name: str = "Omarchy YOLO"
     commit_email: str = "omarchy-yolo@localhost"
+    command_timeout_seconds: int = 120
+    allow_repository_commands: bool = True
 
 
 @dataclass(slots=True)
@@ -52,6 +54,9 @@ class SandboxConfig:
     network: bool = True
     read_only_home: bool = False
     writable_home_paths: tuple[str, ...] = ()
+    hostile_repo_mode: bool = False
+    gate_env_allowlist: tuple[str, ...] = ()
+    agent_env_allowlist: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -59,6 +64,7 @@ class AgentConfig:
     enabled: bool = True
     command: tuple[str, ...] = ()
     review_command: tuple[str, ...] = ()
+    roles: tuple[str, ...] = ()
 
 
 DEFAULT_AGENT_COMMANDS: dict[str, tuple[str, ...]] = {
@@ -70,6 +76,8 @@ DEFAULT_AGENT_COMMANDS: dict[str, tuple[str, ...]] = {
 
 _BRANCH_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$")
 _AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_AGENT_ROLES = frozenset({"worker", "planner", "reviewer", "integrator"})
 
 
 @dataclass(slots=True)
@@ -81,6 +89,14 @@ class Config:
     gates: GateConfig = field(default_factory=GateConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     agents: dict[str, AgentConfig] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.sandbox.hostile_repo_mode and self.sandbox.backend != "bwrap":
+            raise YoloError("sandbox.hostile_repo_mode requires sandbox.backend='bwrap'")
+        if self.sandbox.hostile_repo_mode and self.git.allow_repository_commands:
+            raise YoloError(
+                "sandbox.hostile_repo_mode requires git.allow_repository_commands=false"
+            )
 
     @property
     def db_path(self) -> Path:
@@ -152,6 +168,17 @@ def _branch_prefix(value: Any) -> str:
     return prefix
 
 
+def _identity_value(value: Any, *, field_name: str, maximum: int) -> str:
+    identity = str(value).strip()
+    if not identity:
+        raise YoloError(f"{field_name} cannot be empty")
+    if any(char in identity for char in ("\x00", "\r", "\n")):
+        raise YoloError(f"{field_name} cannot contain control line breaks")
+    if len(identity) > maximum:
+        raise YoloError(f"{field_name} cannot exceed {maximum} characters")
+    return identity
+
+
 def _writable_home_paths(value: Any) -> tuple[str, ...]:
     paths = _tuple_str(value)
     clean: list[str] = []
@@ -160,6 +187,36 @@ def _writable_home_paths(value: Any) -> tuple[str, ...]:
         if not candidate or candidate in {".", ".."} or candidate.startswith("../") or "/../" in candidate:
             raise YoloError("sandbox.writable_home_paths must contain relative paths inside HOME")
         clean.append(candidate)
+    return tuple(clean)
+
+
+def _environment_names(value: Any, *, field_name: str) -> tuple[str, ...]:
+    names = _tuple_str(value)
+    clean: list[str] = []
+    for raw in names:
+        name = raw.strip()
+        if not _ENV_NAME_RE.fullmatch(name):
+            raise YoloError(f"{field_name} contains an invalid environment variable name")
+        if name not in clean:
+            clean.append(name)
+    return tuple(clean)
+
+
+def _agent_roles(value: Any, *, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise YoloError(f"{field_name} must be an array of role names")
+    roles = tuple(str(item) for item in value)
+    clean: list[str] = []
+    for raw in roles:
+        role = raw.strip().lower()
+        if role not in _AGENT_ROLES:
+            raise YoloError(
+                f"{field_name} contains invalid role {role!r}; expected one of {sorted(_AGENT_ROLES)}"
+            )
+        if role not in clean:
+            clean.append(role)
     return tuple(clean)
 
 
@@ -233,29 +290,68 @@ def load_config(path: Path | None = None) -> Config:
         ),
     )
 
+    s = _section(data, "sandbox")
+    backend = str(s.get("backend", "native"))
+    if backend not in {"native", "none", "bwrap"}:
+        raise YoloError("sandbox.backend must be 'native', 'none', or 'bwrap'")
+    hostile_repo_mode = _strict_bool(
+        s.get("hostile_repo_mode"),
+        default=False,
+        name="sandbox.hostile_repo_mode",
+    )
+    if hostile_repo_mode and backend != "bwrap":
+        raise YoloError("sandbox.hostile_repo_mode requires sandbox.backend='bwrap'")
+    sandbox = SandboxConfig(
+        backend=backend,
+        network=_strict_bool(s.get("network"), default=True, name="sandbox.network"),
+        read_only_home=_strict_bool(s.get("read_only_home"), default=False, name="sandbox.read_only_home"),
+        writable_home_paths=_writable_home_paths(s.get("writable_home_paths")),
+        hostile_repo_mode=hostile_repo_mode,
+        gate_env_allowlist=_environment_names(
+            s.get("gate_env_allowlist"), field_name="sandbox.gate_env_allowlist"
+        ),
+        agent_env_allowlist=_environment_names(
+            s.get("agent_env_allowlist"), field_name="sandbox.agent_env_allowlist"
+        ),
+    )
+
     g = _section(data, "git")
+    allow_repository_commands = _strict_bool(
+        g.get("allow_repository_commands"),
+        default=not hostile_repo_mode,
+        name="git.allow_repository_commands",
+    )
+    if hostile_repo_mode and allow_repository_commands:
+        raise YoloError(
+            "sandbox.hostile_repo_mode requires git.allow_repository_commands=false"
+        )
     git = GitConfig(
         require_clean_repo=_strict_bool(g.get("require_clean_repo"), default=True, name="git.require_clean_repo"),
         branch_prefix=_branch_prefix(g.get("branch_prefix", "yolo")),
-        commit_name=str(g.get("commit_name", "Omarchy YOLO"))[:200],
-        commit_email=str(g.get("commit_email", "omarchy-yolo@localhost"))[:320],
+        commit_name=_identity_value(
+            g.get("commit_name", "Omarchy YOLO"),
+            field_name="git.commit_name",
+            maximum=200,
+        ),
+        commit_email=_identity_value(
+            g.get("commit_email", "omarchy-yolo@localhost"),
+            field_name="git.commit_email",
+            maximum=320,
+        ),
+        command_timeout_seconds=_bounded_int(
+            g.get("command_timeout_seconds", 120),
+            default=120,
+            minimum=5,
+            maximum=900,
+            name="git.command_timeout_seconds",
+        ),
+        allow_repository_commands=allow_repository_commands,
     )
 
     gates_section = _section(data, "gates")
     gates = GateConfig(
         commands=_tuple_str(gates_section.get("commands")),
         final_commands=_tuple_str(gates_section.get("final_commands")),
-    )
-
-    s = _section(data, "sandbox")
-    backend = str(s.get("backend", "native"))
-    if backend not in {"native", "none", "bwrap"}:
-        raise YoloError("sandbox.backend must be 'native', 'none', or 'bwrap'")
-    sandbox = SandboxConfig(
-        backend=backend,
-        network=_strict_bool(s.get("network"), default=True, name="sandbox.network"),
-        read_only_home=_strict_bool(s.get("read_only_home"), default=False, name="sandbox.read_only_home"),
-        writable_home_paths=_writable_home_paths(s.get("writable_home_paths")),
     )
 
     agents_section = _section(data, "agents")
@@ -268,6 +364,7 @@ def load_config(path: Path | None = None) -> Config:
             enabled=_strict_bool(raw.get("enabled"), default=name != "gemini", name=f"agents.{name}.enabled"),
             command=_tuple_str(raw.get("command"), default_cmd),
             review_command=_tuple_str(raw.get("review_command")),
+            roles=_agent_roles(raw.get("roles"), field_name=f"agents.{name}.roles"),
         )
     for name, raw in agents_section.items():
         safe_name = _agent_name(name, field_name=f"agents.{name}")
@@ -279,6 +376,7 @@ def load_config(path: Path | None = None) -> Config:
             ),
             command=_tuple_str(raw.get("command")),
             review_command=_tuple_str(raw.get("review_command")),
+            roles=_agent_roles(raw.get("roles"), field_name=f"agents.{safe_name}.roles"),
         )
 
     return Config(

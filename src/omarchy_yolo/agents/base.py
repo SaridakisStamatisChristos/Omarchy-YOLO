@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ..config import AgentConfig, Config
-from ..model import AgentResult
+from ..model import AgentResult, AgentRole
 from ..process import ProcessRunner
 from ..sandbox import Sandbox
 from ..util import YoloError, truncate_utf8
@@ -21,6 +21,8 @@ class AgentLike(Protocol):
     def available(self) -> bool: ...
 
     def supports_profile(self, execution_profile: str) -> bool: ...
+
+    def supports_role(self, role: AgentRole) -> bool: ...
 
     async def run(
         self,
@@ -49,16 +51,74 @@ class CommandAgent:
         self.sandbox = Sandbox(global_config.sandbox)
 
     def available(self) -> bool:
-        return bool(self.config.enabled and self.config.command and shutil.which(self.config.command[0]))
+        worker = bool(self.config.command and shutil.which(self.config.command[0]))
+        reviewer = bool(
+            self.config.review_command and shutil.which(self.config.review_command[0])
+        )
+        return bool(self.config.enabled and (worker or reviewer))
 
     def _trusted_builtin_review_identity(self) -> bool:
         if self.name not in _BUILTIN_REVIEW_AGENTS or not self.config.command:
             return False
-        return Path(self.config.command[0]).name == self.name
+        executable = self.config.command[0]
+        if Path(executable).name != self.name:
+            return False
+        # Bare built-in names retain the v1.x zero-configuration contract. An
+        # explicitly pathed command must resolve to the same executable that the
+        # daemon would select for the built-in name; merely ending in "codex" (or
+        # another built-in name) is not an identity assertion.
+        if executable == self.name:
+            return True
+        configured = shutil.which(executable)
+        expected = shutil.which(self.name)
+        if configured is None or expected is None:
+            return False
+        return Path(configured).resolve() == Path(expected).resolve()
+
+    def declared_roles(self) -> tuple[AgentRole, ...]:
+        if self.config.roles:
+            return tuple(AgentRole(role) for role in self.config.roles)
+        roles: list[AgentRole] = []
+        if self.config.command:
+            roles.extend((AgentRole.WORKER, AgentRole.INTEGRATOR))
+        if self.config.review_command or self._trusted_builtin_review_identity():
+            roles.extend((AgentRole.PLANNER, AgentRole.REVIEWER))
+        return tuple(roles)
+
+    def supports_role(self, role: AgentRole) -> bool:
+        if role not in self.declared_roles():
+            return False
+        if role in {AgentRole.PLANNER, AgentRole.REVIEWER}:
+            return self.supports_profile("review")
+        return bool(self.config.command)
+
+    def contract(self) -> dict[str, object]:
+        configured = shutil.which(self.config.command[0]) if self.config.command else None
+        review_executable = (
+            shutil.which(self.config.review_command[0]) if self.config.review_command else None
+        )
+        review_kind = "none"
+        if self.config.review_command:
+            review_kind = "explicit-command"
+        elif self._trusted_builtin_review_identity():
+            review_kind = "verified-builtin"
+        effective_review_executable = ""
+        if self.config.review_command:
+            effective_review_executable = review_executable or ""
+        elif review_kind == "verified-builtin":
+            effective_review_executable = configured or ""
+        return {
+            "roles": [role.value for role in self.declared_roles()],
+            "executable": configured or "",
+            "review_executable": effective_review_executable,
+            "review_capability": review_kind,
+        }
 
     def supports_profile(self, execution_profile: str) -> bool:
+        if execution_profile in {"yolo-worktree", "danger-yolo"}:
+            return bool(self.config.command)
         if execution_profile != "review":
-            return True
+            return False
         if self.config.review_command:
             return bool(shutil.which(self.config.review_command[0]))
         return self._trusted_builtin_review_identity()
@@ -111,7 +171,11 @@ class CommandAgent:
                 "configure agents.<name>.review_command"
             )
 
-        if execution_profile != "danger-yolo" or self.name != "codex":
+        if execution_profile == "yolo-worktree":
+            return argv
+        if execution_profile != "danger-yolo":
+            raise YoloError(f"unknown agent execution profile: {execution_profile}")
+        if self.name != "codex":
             return argv
         argv = [
             token
@@ -157,7 +221,7 @@ class CommandAgent:
             cwd,
             execution_profile=execution_profile,
         )
-        env = self.sandbox.environment()
+        env = self.sandbox.environment(execution_profile)
         if extra_env:
             env.update(extra_env)
         # Safety policy wins over caller-supplied environment additions.

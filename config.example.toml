@@ -30,12 +30,20 @@ require_clean_repo = true
 branch_prefix = "yolo"
 commit_name = "Omarchy YOLO"
 commit_email = "omarchy-yolo@localhost"
+# Every control-plane Git subprocess is bounded and descendant processes are
+# terminated with it. Range: 5..900 seconds.
+command_timeout_seconds = 120
+# Repository-configured clean/smudge/process filters and merge drivers can run
+# commands during orchestrator Git operations. Disable for untrusted code; hostile
+# repository mode below requires false and defaults it to false when omitted.
+allow_repository_commands = true
 
 [gates]
 # Empty means auto-detect from the repository. Gate processes use the dedicated
 # gate sandbox profile when sandbox.backend = "bwrap": repository cwd remains
-# writable, while host filesystem/HOME are read-only and network follows the
-# sandbox.network policy.
+# writable, while host filesystem/HOME are read-only. Hostile repository mode
+# additionally hides HOME/runtime, strips the gate environment, and forces gates
+# offline.
 commands = []
 final_commands = []
 
@@ -47,13 +55,27 @@ backend = "native"
 network = true
 # With bwrap, review/planning always sees HOME read-only. Worker mode can also
 # make HOME read-only and selectively re-enable only the credential/session dirs
-# required by a coding CLI. Gate mode does not inherit writable HOME exceptions.
+# required by a coding CLI. In hostile mode HOME is hidden: these directories are
+# the only HOME content exposed (writable to workers, read-only to reviewers).
+# Gate mode never inherits HOME exceptions.
 read_only_home = false
 writable_home_paths = []
+# Stronger opt-in policy for repositories whose tracked content and configured
+# gates are hostile. Requires backend="bwrap". Gate processes receive a fresh
+# HOME/runtime view, no network, and only the environment allowlist below;
+# orchestrator Git disables repository-configured filter/merge commands.
+hostile_repo_mode = false
+gate_env_allowlist = []
+# Hostile mode also filters worker/planner/reviewer environments. Explicitly list
+# only variables an agent CLI must receive (for example one provider token).
+agent_env_allowlist = []
 
 [agents.codex]
 enabled = true
 command = ["codex", "exec", "--full-auto", "--sandbox", "workspace-write"]
+# Optional least-privilege contract. When omitted, built-ins infer worker,
+# integrator, planner and reviewer roles from their verified profile support.
+# roles = ["worker", "planner", "reviewer", "integrator"]
 
 [agents.claude]
 enabled = true
@@ -69,9 +91,11 @@ command = ["gemini", "-p"]
 # Custom/unsupported reviewer CLIs are never assumed read-only. To make a custom
 # agent eligible for planner/reviewer roles, explicitly declare a non-mutating command:
 # review_command = ["gemini", "-p", "--approval-mode", "plan"]
+# roles = ["worker", "planner", "reviewer", "integrator"]
 
 # Example custom adapter:
 # [agents.local]
 # enabled = true
 # command = ["my-agent", "--write"]
 # review_command = ["my-agent", "--read-only"]
+# roles = ["worker", "planner", "reviewer", "integrator"]

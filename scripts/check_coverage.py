@@ -10,18 +10,18 @@ from pathlib import Path
 # untested trust boundary behind well-covered data/model code. Raise them as the
 # corresponding failure-injection suites expand; never lower them to make CI green.
 FLOORS: dict[str, float] = {
-    "src/omarchy_yolo/orchestrator.py": 70.0,
-    "src/omarchy_yolo/orchestrator_integration.py": 55.0,
+    "src/omarchy_yolo/orchestrator.py": 72.0,
+    "src/omarchy_yolo/orchestrator_integration.py": 60.0,
     "src/omarchy_yolo/orchestrator_task.py": 65.0,
-    "src/omarchy_yolo/git.py": 80.0,
-    "src/omarchy_yolo/gates.py": 85.0,
-    "src/omarchy_yolo/process.py": 85.0,
+    "src/omarchy_yolo/git.py": 83.0,
+    "src/omarchy_yolo/gates.py": 90.0,
+    "src/omarchy_yolo/process.py": 90.0,
     "src/omarchy_yolo/db_core.py": 90.0,
-    "src/omarchy_yolo/db_records.py": 80.0,
+    "src/omarchy_yolo/db_records.py": 82.0,
     "src/omarchy_yolo/db_recovery.py": 80.0,
-    "src/omarchy_yolo/runtime.py": 90.0,
-    "src/omarchy_yolo/sandbox.py": 90.0,
-    "src/omarchy_yolo/review_source.py": 80.0,
+    "src/omarchy_yolo/runtime.py": 94.0,
+    "src/omarchy_yolo/sandbox.py": 95.0,
+    "src/omarchy_yolo/review_source.py": 85.0,
     "src/omarchy_yolo/reviewer.py": 75.0,
 }
 

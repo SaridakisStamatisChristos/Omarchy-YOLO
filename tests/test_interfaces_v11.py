@@ -460,7 +460,10 @@ def test_cli_logs_parser_and_ui(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 
 
 async def test_cli_doctor_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
-    cfg = make_config(tmp_path, python=AgentConfig(command=("python",)))
+    cfg = make_config(
+        tmp_path,
+        python=AgentConfig(command=("python",), review_command=("python",)),
+    )
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
 
