@@ -92,10 +92,10 @@ def test_custom_agent_can_declare_separate_review_command(tmp_path: Path) -> Non
     agent = CommandAgent(
         "custom",
         AgentConfig(
-            command=("custom-agent", "--write"),
-            review_command=("custom-agent", "--read-only"),
+            command=("python", "--write"),
+            review_command=("python", "--read-only"),
         ),
         cfg(tmp_path),
     )
     assert agent.supports_profile("review")
-    assert agent.command_for_profile("review") == ["custom-agent", "--read-only"]
+    assert agent.command_for_profile("review") == ["python", "--read-only"]
