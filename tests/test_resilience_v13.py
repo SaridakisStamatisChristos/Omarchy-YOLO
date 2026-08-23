@@ -947,7 +947,6 @@ async def test_agent_and_gate_runners_terminate_surviving_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     leader_code = _surviving_descendant_leader_code()
-    monkeypatch.setattr("omarchy_yolo.process._PIPE_DRAIN_TIMEOUT_SECONDS", 0.2)
     monkeypatch.setattr(
         "omarchy_yolo.process._PROCESS_TERMINATION_GRACE_SECONDS", 0.3
     )
