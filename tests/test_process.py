@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import errno
+import time
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
 from omarchy_yolo.process import ProcessRunner
+from omarchy_yolo.util import YoloError
 
 
 async def test_process_output_and_log_are_bounded(tmp_path: Path) -> None:
@@ -57,3 +60,31 @@ async def test_log_open_failure_happens_before_child_spawn(
             log_path=tmp_path / "full.log",
         )
     assert not called
+
+
+async def test_wrapped_log_failure_terminates_child_and_is_propagated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omarchy_yolo import process as process_module
+
+    real_open = process_module.open_private_binary
+
+    def fail_appends(path: Path, *, append: bool = False) -> BinaryIO:
+        if append:
+            raise YoloError("cannot safely open private file: synthetic ENOSPC")
+        return real_open(path, append=append)
+
+    monkeypatch.setattr(process_module, "open_private_binary", fail_appends)
+    started = time.monotonic()
+    with pytest.raises(YoloError, match="synthetic ENOSPC"):
+        await ProcessRunner().run(
+            [
+                "python",
+                "-c",
+                "import time; print('trigger', flush=True); time.sleep(30)",
+            ],
+            cwd=tmp_path,
+            timeout_seconds=20,
+            log_path=tmp_path / "midstream.log",
+        )
+    assert time.monotonic() - started < 10
