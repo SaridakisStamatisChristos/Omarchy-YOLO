@@ -33,6 +33,9 @@ class TaskExecutionMixin:
             branch = task.branch
             base_commit = task.base_commit
         elif task.branch and await asyncio.to_thread(repo.branch_exists, task.branch):
+            # Recovery path: keep durable commits on the task branch even if the worktree directory
+            # vanished or its registration went stale. Reattaching is safer than recreating the
+            # branch from integration and silently discarding progress.
             branch = task.branch
             base_commit = task.base_commit or await asyncio.to_thread(repo.head, integration_path)
             worktree = stored_worktree or (
@@ -70,6 +73,9 @@ class TaskExecutionMixin:
                 task_id=task_id,
             )
 
+        # `max_attempts` is a budget per scheduling run, not a lifetime cap. This lets an
+        # explicitly resumed failed task make fresh progress without deleting prior attempt history.
+        # Attempt numbers remain globally monotonic per task, satisfying the DB uniqueness invariant.
         first_attempt = task.attempts + 1
         last_attempt = task.attempts + self.config.engine.max_attempts
         for attempt_number in range(first_attempt, last_attempt + 1):
@@ -275,3 +281,4 @@ class TaskExecutionMixin:
             except Exception as exc:
                 errors.append(f"{candidate}: {exc}")
         return ReviewResult("retry", "review infrastructure failed", tuple(errors))
+
