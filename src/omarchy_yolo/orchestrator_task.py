@@ -2,15 +2,47 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .git import GitRepo
-from .model import ReviewResult, TaskRecord, TaskState
+from .model import GateResult, ReviewResult, TaskRecord, TaskState
 from .prompts import worker_prompt
 from .reviewer import format_gates
 from .util import YoloError, slug
 
+if TYPE_CHECKING:
+    from .agents import AgentRegistry
+    from .config import Config
+    from .db import Database
+    from .reviewer import Reviewer
+
 
 class TaskExecutionMixin:
+    if TYPE_CHECKING:
+        config: Config
+        db: Database
+        registry: AgentRegistry
+        reviewer: Reviewer
+        _merge_lock: asyncio.Lock
+
+        async def _run_gates(
+            self,
+            job_id: str,
+            task: TaskRecord | None,
+            cwd: Path,
+            *,
+            final: bool,
+            suffix: str = "worker",
+        ) -> list[GateResult]: ...
+
+        async def _integrate_task(
+            self,
+            job_id: str,
+            task: TaskRecord,
+            repo: GitRepo,
+            integration_path: Path,
+        ) -> tuple[bool, str]: ...
+
     async def _run_task(
         self,
         job_id: str,
@@ -23,6 +55,9 @@ class TaskExecutionMixin:
         retry_context = task.last_error
 
         stored_worktree = Path(task.worktree) if task.worktree else None
+        branch_exists = False
+        if task.branch:
+            branch_exists = await asyncio.to_thread(repo.branch_exists, task.branch)
         if (
             stored_worktree is not None
             and task.branch
@@ -32,7 +67,10 @@ class TaskExecutionMixin:
             worktree = stored_worktree
             branch = task.branch
             base_commit = task.base_commit
-        elif task.branch and await asyncio.to_thread(repo.branch_exists, task.branch):
+        elif task.branch and branch_exists:
+            # Recovery path: keep durable commits on the task branch even if the worktree directory
+            # vanished or its registration went stale. Reattaching is safer than recreating the
+            # branch from integration and silently discarding progress.
             branch = task.branch
             base_commit = task.base_commit or await asyncio.to_thread(repo.head, integration_path)
             worktree = stored_worktree or (
@@ -52,9 +90,7 @@ class TaskExecutionMixin:
         else:
             async with self._merge_lock:
                 base_commit = await asyncio.to_thread(repo.head, integration_path)
-                branch = (
-                    f"{self.config.git.branch_prefix}/{job_id}/{slug(task.logical_id)}"
-                )
+                branch = f"{self.config.git.branch_prefix}/{job_id}/{slug(task.logical_id)}"
                 worktree = self.config.worktrees_dir / job_id / f"task-{task.seq}-{slug(task.logical_id)}"
                 await asyncio.to_thread(repo.ensure_worktree, worktree, branch, base_commit)
             self.db.update_task(
@@ -70,6 +106,9 @@ class TaskExecutionMixin:
                 task_id=task_id,
             )
 
+        # `max_attempts` is a budget per scheduling run, not a lifetime cap. This lets an
+        # explicitly resumed failed task make fresh progress without deleting prior attempt history.
+        # Attempt numbers remain globally monotonic per task, satisfying the DB uniqueness invariant.
         first_attempt = task.attempts + 1
         last_attempt = task.attempts + self.config.engine.max_attempts
         for attempt_number in range(first_attempt, last_attempt + 1):
@@ -241,7 +280,7 @@ class TaskExecutionMixin:
         goal: str,
         repo: GitRepo,
         worktree: Path,
-        gates: list[object],
+        gates: list[GateResult],
         attempt_number: int,
     ) -> ReviewResult:
         diff = await asyncio.to_thread(repo.diff, worktree, task.base_commit)

@@ -47,7 +47,8 @@
 State defaults to `$XDG_STATE_HOME/omarchy-yolo` (or `~/.local/state/omarchy-yolo`). SQLite uses WAL
 mode and append-only events. On daemon restart, jobs that were planning/running are re-queued. Tasks
 that were in-flight are reset to pending, their running attempt records are closed as cancelled, and execution
-resumes from the durable task worktree with new monotonic attempt numbers.
+resumes from the durable task worktree with new monotonic attempt numbers. Explicitly stopping jobs is different:
+`stop_requested` is durable and restart recovery leaves those jobs in `stopped` until a user requests `resume`.
 
 ## Agent protocol
 

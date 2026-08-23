@@ -44,23 +44,26 @@ rm -rf "$PLUGIN_DIR"
 mkdir -p "$PLUGIN_DIR"
 cp -a "$ROOT/shell-plugin/." "$PLUGIN_DIR/"
 
+PLUGIN_VALID=1
 if command -v omarchy >/dev/null; then
-  omarchy plugin validate "$PLUGIN_DIR" || {
+  if ! omarchy plugin validate "$PLUGIN_DIR"; then
+    PLUGIN_VALID=0
     echo "Omarchy rejected the shell plugin manifest; leaving it installed but disabled." >&2
-  }
+  fi
 fi
 if command -v omarchy-shell >/dev/null; then
   omarchy-shell -q shell rescanPlugins || true
 fi
-if command -v omarchy >/dev/null; then
+if (( PLUGIN_VALID )) && command -v omarchy >/dev/null; then
   omarchy plugin enable dev.aether.yolo >/dev/null 2>&1 || true
 fi
 
 if command -v systemctl >/dev/null; then
   systemctl --user daemon-reload
-  systemctl --user enable --now omarchy-yolo.service
+  systemctl --user enable omarchy-yolo.service >/dev/null
+  systemctl --user restart omarchy-yolo.service
 fi
 
-echo "Installed Omarchy YOLO 1.0.0"
+echo "Installed Omarchy YOLO 1.0.1"
 echo "Run: yolo doctor"
 echo "Then: yolo run --watch \"Audit this repo, fix every material defect, and leave a release-ready candidate\""

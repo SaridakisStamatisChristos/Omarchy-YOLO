@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 from pathlib import Path
 
 from .agents import AgentRegistry
@@ -11,11 +10,11 @@ from .gates import GateRunner
 from .git import GitError, GitRepo
 from .model import JobState, PlannedTask, TaskState
 from .omarchy import notify
+from .orchestrator_integration import IntegrationMixin
+from .orchestrator_task import TaskExecutionMixin
 from .planner import Planner
 from .reviewer import Reviewer
 from .util import YoloError, ensure_private_dir
-from .orchestrator_task import TaskExecutionMixin
-from .orchestrator_integration import IntegrationMixin
 
 
 class TaskExecutionError(YoloError):
@@ -105,15 +104,33 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             await self._cancel_active()
             current = self.db.get_job(job_id)
             if current.stop_requested:
+                self.db.settle_inflight(
+                    job_id,
+                    task_state=TaskState.STOPPED,
+                    attempt_state="cancelled",
+                    summary="stopped by user request",
+                )
                 self.db.update_job(job_id, state=JobState.STOPPED)
                 self.db.event(job_id, "job.stopped")
                 notify("YOLO stopped", Path(current.repo).name)
             else:
+                self.db.settle_inflight(
+                    job_id,
+                    task_state=TaskState.PENDING,
+                    attempt_state="cancelled",
+                    summary="orchestrator interrupted",
+                )
                 self.db.update_job(job_id, state=JobState.QUEUED)
                 self.db.event(job_id, "job.interrupted")
             raise
         except Exception as exc:
             await self._cancel_active()
+            self.db.settle_inflight(
+                job_id,
+                task_state=TaskState.FAILED,
+                attempt_state="failed",
+                summary=f"orchestrator failure: {exc}",
+            )
             self.db.update_job(job_id, state=JobState.FAILED, error=str(exc))
             self.db.event(job_id, "job.failed", {"error": str(exc)})
             notify("YOLO failed", f"{Path(job.repo).name}: {str(exc)[:180]}")
@@ -137,6 +154,7 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             )
             self.db.event(job_id, "planner.completed", {"agent": planner_name, "summary": summary, "tasks": len(tasks)})
         except Exception as exc:
+            # Autonomous degradation: a malformed/failed planner should not brick the entire run.
             tasks = [
                 PlannedTask(
                     logical_id="T1",
@@ -209,3 +227,4 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                     task_id = handle.get_name()
                     failed = self.db.get_task(task_id)
                     raise TaskExecutionError(f"{failed.logical_id} failed: {failed.last_error}")
+

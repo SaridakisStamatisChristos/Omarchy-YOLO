@@ -11,9 +11,14 @@ RestartSec=2
 KillMode=mixed
 TimeoutStopSec=20
 NoNewPrivileges=true
+UMask=0077
 PrivateTmp=true
 RestrictSUIDSGID=true
 LockPersonality=true
+ProtectClock=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-%h/.config/omarchy-yolo/env

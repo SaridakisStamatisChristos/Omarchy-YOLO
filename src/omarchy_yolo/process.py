@@ -7,12 +7,18 @@ import time
 from pathlib import Path
 
 from .model import AgentResult
-from .util import ensure_private_dir, shell_join
+from .util import ensure_private_dir, open_private_binary, shell_join
 
 
 class ProcessRunner:
-    def __init__(self, *, capture_limit_bytes: int = 2_000_000):
-        self.capture_limit_bytes = capture_limit_bytes
+    def __init__(
+        self,
+        *,
+        capture_limit_bytes: int = 2_000_000,
+        log_limit_bytes: int = 64_000_000,
+    ):
+        self.capture_limit_bytes = max(1, capture_limit_bytes)
+        self.log_limit_bytes = max(1, log_limit_bytes)
 
     async def run(
         self,
@@ -40,27 +46,40 @@ class ProcessRunner:
         stdout_buf = bytearray()
         stderr_buf = bytearray()
         lock = asyncio.Lock()
+        logged_bytes = 0
+        log_truncated = False
 
         async def pump(stream: asyncio.StreamReader | None, target: bytearray, prefix: bytes) -> None:
+            nonlocal logged_bytes, log_truncated
             if stream is None:
                 return
             while True:
                 chunk = await stream.read(65536)
                 if not chunk:
                     break
-                if len(target) < self.capture_limit_bytes:
-                    remaining = self.capture_limit_bytes - len(target)
-                    target.extend(chunk[:remaining])
+                target.extend(chunk)
+                if len(target) > self.capture_limit_bytes:
+                    del target[: len(target) - self.capture_limit_bytes]
                 async with lock:
-                    with log_path.open("ab") as fh:
-                        fh.write(prefix)
-                        fh.write(chunk)
+                    if logged_bytes < self.log_limit_bytes:
+                        remaining = self.log_limit_bytes - logged_bytes
+                        payload = prefix + chunk
                         if not chunk.endswith(b"\n"):
-                            fh.write(b"\n")
+                            payload += b"\n"
+                        payload = payload[:remaining]
+                        with open_private_binary(log_path, append=True) as fh:
+                            fh.write(payload)
+                        logged_bytes += len(payload)
+                    elif not log_truncated:
+                        with open_private_binary(log_path, append=True) as fh:
+                            fh.write(b"\n[omarchy-yolo: log output truncated]\n")
+                        log_truncated = True
 
-        with log_path.open("wb") as fh:
+        with open_private_binary(log_path) as fh:
             safe_cmd = shell_join(argv + (["<PROMPT>"] if prompt_arg is not None else []))
-            fh.write(f"$ {safe_cmd}\n".encode())
+            header = f"$ {safe_cmd}\n".encode()
+            fh.write(header[: self.log_limit_bytes])
+            logged_bytes = min(len(header), self.log_limit_bytes)
 
         out_task = asyncio.create_task(pump(proc.stdout, stdout_buf, b"[stdout] "))
         err_task = asyncio.create_task(pump(proc.stderr, stderr_buf, b"[stderr] "))

@@ -14,3 +14,9 @@ credential-exfiltration risk. For hostile code, use a disposable VM/container an
 
 The final integration branch is preserved even when `auto_apply = false`. Automatic application uses
 fast-forward only and is refused if the source branch moved or the user's working tree is dirty.
+
+## 1.0.1 hardening boundaries
+
+The daemon and CLI now bound IPC messages, model prompts/output, event payloads, Git review diffs, gate/process capture, and log growth. Worktree deletion is fail-closed unless Git proves that the target belongs to the expected repository, and orchestrator Git commands suppress repository hooks. UI/terminal surfaces treat agent-controlled text as plain/untrusted text.
+
+These controls reduce accidental blast radius; they do not turn `danger-yolo` into a security sandbox. Repository gates intentionally execute project code, and Claude/OpenCode unattended modes may have broader user-level filesystem access unless the optional Bubblewrap backend (or a disposable VM/container) is used. Never treat a worktree boundary as an OS security boundary.

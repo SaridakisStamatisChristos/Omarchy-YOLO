@@ -21,7 +21,7 @@ systemctl --user restart omarchy-yolo.service
 journalctl --user -u omarchy-yolo.service -f
 ```
 
-Jobs are not owned by client terminals. Restart recovery requeues nonterminal jobs from SQLite.
+Jobs are not owned by client terminals. Restart recovery requeues interrupted active jobs from SQLite, while an explicit `stop` remains stopped across daemon restarts. `resume` atomically closes stale running attempts before making tasks schedulable again.
 
 ## Job lifecycle
 

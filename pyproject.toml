@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omarchy-yolo"
-version = "1.0.0"
+version = "1.0.1"
 description = "Persistent, multi-agent YOLO orchestration for Omarchy Quattro"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -45,8 +45,8 @@ line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
-ignore = ["E501"]
+select = ["E", "F", "B", "ASYNC"]
+ignore = ["E501", "ASYNC240"]
 
 [tool.mypy]
 python_version = "3.12"
