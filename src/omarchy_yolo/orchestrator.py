@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 from pathlib import Path
 
 from .agents import AgentRegistry
@@ -11,11 +10,11 @@ from .gates import GateRunner
 from .git import GitError, GitRepo
 from .model import JobState, PlannedTask, TaskState
 from .omarchy import notify
+from .orchestrator_integration import IntegrationMixin
+from .orchestrator_task import TaskExecutionMixin
 from .planner import Planner
 from .reviewer import Reviewer
 from .util import YoloError, ensure_private_dir
-from .orchestrator_task import TaskExecutionMixin
-from .orchestrator_integration import IntegrationMixin
 
 
 class TaskExecutionError(YoloError):

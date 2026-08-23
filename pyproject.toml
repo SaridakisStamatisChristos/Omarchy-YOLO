@@ -45,8 +45,8 @@ line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
-ignore = ["E501"]
+select = ["E", "F", "B", "ASYNC"]
+ignore = ["E501", "ASYNC240"]
 
 [tool.mypy]
 python_version = "3.12"

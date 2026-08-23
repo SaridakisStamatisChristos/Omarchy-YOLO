@@ -4,12 +4,11 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .model import JobRecord, JobState, PlannedTask, TaskRecord, TaskState
-from .util import ensure_private_dir, json_dumps, new_id, utc_ts
+from .model import JobRecord, JobState, TaskRecord, TaskState
+from .util import ensure_private_dir
 
 
 SCHEMA = """
