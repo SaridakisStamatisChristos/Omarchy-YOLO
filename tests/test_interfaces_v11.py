@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from omarchy_yolo import cli
+from omarchy_yolo import __version__, cli
 from omarchy_yolo.agents import AgentRegistry
 from omarchy_yolo.agents.base import CommandAgent, MAX_PROMPT_ARG_BYTES
 from omarchy_yolo.config import AgentConfig, Config, SandboxConfig
@@ -347,7 +347,7 @@ async def test_daemon_actual_socket_ping_and_shutdown(
     daemon = make_daemon(tmp_path, monkeypatch)
     await daemon.start()
     result = await rpc_call(daemon.socket_path, "ping")
-    assert result["version"] == "1.1.0"
+    assert result["version"] == __version__
     assert daemon.socket_path.stat().st_mode & 0o777 == 0o600
     await daemon.shutdown()
     assert not daemon.socket_path.exists()
@@ -370,7 +370,7 @@ async def test_daemon_dispatch_status_events_agents_and_unknown(
         auto_apply=False,
     )
     daemon.db.add_tasks(job.id, [PlannedTask("T1", "Title", "Description")])
-    assert (await daemon.dispatch("ping", {}))["version"] == "1.1.0"
+    assert (await daemon.dispatch("ping", {}))["version"] == __version__
     assert (await daemon.dispatch("runtime", {}))["worker_capacity"] >= 1
     assert (await daemon.dispatch("status", {"job_id": job.id}))["tasks"][0]["logical_id"] == "T1"
     assert len(await daemon.dispatch("jobs", {"limit": "999999"})) == 1
