@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .model import JobRecord, JobState, TaskRecord, TaskState
 from .util import YoloError, ensure_private_dir
@@ -130,7 +130,7 @@ class DatabaseCore:
 
     def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         with self._lock:
-            return self._conn.execute(sql, params).fetchone()
+            return cast(sqlite3.Row | None, self._conn.execute(sql, params).fetchone())
 
     def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self._lock:
