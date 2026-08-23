@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from omarchy_yolo.agents import AgentRegistry
 from omarchy_yolo.config import Config
 from omarchy_yolo.db import CURRENT_SCHEMA_VERSION, Database
 from omarchy_yolo.model import JobState, PlannedTask, TaskState
 from omarchy_yolo.provenance import DOSSIER_SCHEMA_VERSION, build_dossier, verify_dossier
-from omarchy_yolo.agents import AgentRegistry
 from omarchy_yolo.util import YoloError
 
 
@@ -52,6 +52,11 @@ def test_legacy_database_migrates_with_private_backup(tmp_path: Path) -> None:
         backup = db.last_migration_backup
         assert backup.exists()
         assert backup.stat().st_mode & 0o777 == 0o600
+        backup_conn = sqlite3.connect(backup)
+        try:
+            assert backup_conn.execute("PRAGMA user_version").fetchone()[0] == 0
+        finally:
+            backup_conn.close()
         row = db._execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dossiers'"
         ).fetchone()
@@ -72,7 +77,7 @@ def test_future_database_schema_fails_closed(tmp_path: Path) -> None:
         Database(path)
 
 
-def test_dossier_is_deterministic_and_verifiable(tmp_path: Path) -> None:
+def test_dossier_is_deterministic_verifiable_and_boundary_stable(tmp_path: Path) -> None:
     cfg = Config(
         state_dir=tmp_path / "state",
         config_path=tmp_path / "config.toml",
@@ -120,7 +125,7 @@ def test_dossier_is_deterministic_and_verifiable(tmp_path: Path) -> None:
             job_id=job.id,
             final_commit="b" * 40,
             final_summary="release accepted",
-            source_apply_outcome="not-requested",
+            source_apply_intent="not-requested",
         )
         second_content, second_hash = build_dossier(
             db=db,
@@ -129,7 +134,7 @@ def test_dossier_is_deterministic_and_verifiable(tmp_path: Path) -> None:
             job_id=job.id,
             final_commit="b" * 40,
             final_summary="release accepted",
-            source_apply_outcome="not-requested",
+            source_apply_intent="not-requested",
         )
         assert first_content == second_content
         assert first_hash == second_hash
@@ -137,6 +142,7 @@ def test_dossier_is_deterministic_and_verifiable(tmp_path: Path) -> None:
         payload = json.loads(first_content)
         assert payload["dossier_schema_version"] == DOSSIER_SCHEMA_VERSION
         assert payload["job"]["final_commit"] == "b" * 40
+        assert payload["job"]["source_apply_intent"] == "not-requested"
         assert payload["event_ledger"]["count"] >= 2
 
         db.store_dossier(
@@ -145,6 +151,23 @@ def test_dossier_is_deterministic_and_verifiable(tmp_path: Path) -> None:
             sha256=first_hash,
             content=first_content,
         )
+        db.event(job.id, "job.dossier_created", {"sha256": first_hash})
+        db.update_job(job.id, state=JobState.COMPLETED)
+        db.event(job.id, "job.completed", {"dossier_sha256": first_hash})
+        db.event(job.id, "job.cleanup_failed", {"synthetic": True})
+
+        regenerated, regenerated_hash = build_dossier(
+            db=db,
+            config=cfg,
+            registry=registry,
+            job_id=job.id,
+            final_commit="b" * 40,
+            final_summary="release accepted",
+            source_apply_intent="not-requested",
+        )
+        assert regenerated == first_content
+        assert regenerated_hash == first_hash
+
         stored = db.get_dossier(job.id)
         assert stored is not None
         assert stored["sha256"] == first_hash
