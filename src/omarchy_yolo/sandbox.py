@@ -24,8 +24,10 @@ class Sandbox:
 
         # The host root is read-only. Workers may optionally receive a writable HOME or a
         # narrowly-scoped set of HOME subpaths. Planner/reviewer processes are always forced
-        # to a read-only HOME because their role is observational and must not mutate auth or
-        # session state even when worker mode is deliberately more permissive.
+        # to a read-only HOME and their repository cwd is mounted read-only as an OS-level
+        # backstop to the CLI-specific review/plan permission profile.
+        review_mode = execution_profile == "review"
+        cwd_bind = "--ro-bind" if review_mode else "--bind"
         wrapped = [
             executable,
             "--die-with-parent",
@@ -41,15 +43,14 @@ class Sandbox:
             "/",
             "--tmpfs",
             "/tmp",
-            "--bind",
+            cwd_bind,
             str(cwd),
             str(cwd),
             "--chdir",
             str(cwd),
         ]
         home = Path.home().resolve()
-        force_read_only_home = execution_profile == "review"
-        if home.exists() and not force_read_only_home:
+        if home.exists() and not review_mode:
             if not self.config.read_only_home:
                 wrapped.extend(["--bind", str(home), str(home)])
             else:
