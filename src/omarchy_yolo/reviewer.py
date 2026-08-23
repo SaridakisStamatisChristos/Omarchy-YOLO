@@ -187,8 +187,6 @@ class Reviewer:
         if verdict not in {"pass", "retry", "fail"}:
             raise YoloError(f"reviewer returned invalid verdict '{verdict}'")
         summary = summary_raw.strip()
-        if not summary:
-            raise YoloError("reviewer summary must be non-empty")
         if len(summary) > MAX_REVIEW_SUMMARY_CHARS:
             raise YoloError("reviewer summary is too large")
         if not isinstance(raw_findings, list):
@@ -203,6 +201,11 @@ class Reviewer:
             if len(finding) > MAX_REVIEW_FINDING_CHARS:
                 raise YoloError("reviewer finding is too large")
             findings.append(finding)
-        if verdict == "pass" and findings:
-            raise YoloError("reviewer returned pass with material findings")
+        if verdict == "pass":
+            if findings:
+                raise YoloError("reviewer returned pass with material findings")
+            if not summary:
+                raise YoloError("reviewer pass verdict must include a semantic summary")
+        elif not summary and not any(findings):
+            raise YoloError("reviewer non-pass verdict must include a summary or finding")
         return ReviewResult(verdict, summary, tuple(findings))
