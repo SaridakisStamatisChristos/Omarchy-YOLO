@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -61,3 +62,32 @@ def test_single_long_line_is_split_without_losing_tail(git_repo: Path) -> None:
     assert manifest == ["long.txt"]
     assert len(chunks) >= 6
     assert "TAIL_SENTINEL" in "".join(chunk.text for chunk in chunks)
+
+
+def test_non_utf8_filename_round_trips_to_git_and_is_safely_rendered(
+    git_repo: Path,
+) -> None:
+    repo = GitRepo.discover(git_repo)
+    base = repo.head()
+    raw_name = b"hostile-\xff.txt"
+    actual_name = os.fsdecode(raw_name)
+    (git_repo / actual_name).write_text("NON_UTF8_SENTINEL\n")
+    repo.commit_all(git_repo, "non utf8 filename", GitConfig())
+
+    actual_files = changed_files(repo, git_repo, base, max_files=10)
+    assert len(actual_files) == 1
+    assert os.fsencode(actual_files[0]) == raw_name
+
+    manifest, chunks = build_review_chunks(
+        repo,
+        git_repo,
+        base,
+        max_files=10,
+        chunk_bytes=20_000,
+        chunk_files=4,
+    )
+    assert len(manifest) == 1
+    assert "\\udcff" in manifest[0]
+    combined = "\n".join(chunk.text for chunk in chunks)
+    assert "NON_UTF8_SENTINEL" in combined
+    assert manifest[0] in combined
