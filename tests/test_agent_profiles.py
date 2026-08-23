@@ -11,27 +11,64 @@ def cfg(tmp_path: Path) -> Config:
 
 
 def test_codex_danger_profile(tmp_path: Path) -> None:
-    agent = CommandAgent("codex", AgentConfig(command=("codex", "exec", "--full-auto", "--sandbox", "workspace-write")), cfg(tmp_path))
+    agent = CommandAgent(
+        "codex",
+        AgentConfig(command=("codex", "exec", "--full-auto", "--sandbox", "workspace-write")),
+        cfg(tmp_path),
+    )
     argv = agent.command_for_profile("danger-yolo")
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert "workspace-write" not in argv
 
 
 def test_claude_review_profile_is_plan_mode(tmp_path: Path) -> None:
-    agent = CommandAgent("claude", AgentConfig(command=("claude", "-p", "--dangerously-skip-permissions", "--output-format", "json")), cfg(tmp_path))
+    agent = CommandAgent(
+        "claude",
+        AgentConfig(command=("claude", "-p", "--dangerously-skip-permissions", "--output-format", "json")),
+        cfg(tmp_path),
+    )
     argv = agent.command_for_profile("review")
     assert "--dangerously-skip-permissions" not in argv
     assert argv[-2:] == ["--permission-mode", "plan"]
 
 
 def test_opencode_review_profile_denies_mutation_and_external_access(tmp_path: Path) -> None:
-    agent = CommandAgent("opencode", AgentConfig(command=("opencode", "run", "--format", "json", "--auto")), cfg(tmp_path))
+    agent = CommandAgent(
+        "opencode",
+        AgentConfig(command=("opencode", "run", "--format", "json", "--auto")),
+        cfg(tmp_path),
+    )
     policy = agent.environment_for_profile("review")
     assert "OPENCODE_CONFIG_CONTENT" in policy
     import json
+
     payload = json.loads(policy["OPENCODE_CONFIG_CONTENT"])
     permission = payload["permission"]
     assert permission["edit"] == "deny"
     assert permission["bash"] == "deny"
     assert permission["external_directory"] == "deny"
     assert agent.command_for_profile("review")[-1] == "--auto"
+
+
+
+def test_codex_review_overrides_equals_style_sandbox_and_full_auto(tmp_path: Path) -> None:
+    agent = CommandAgent(
+        "codex",
+        AgentConfig(command=("codex", "exec", "--full-auto", "--sandbox=workspace-write")),
+        cfg(tmp_path),
+    )
+    argv = agent.command_for_profile("review")
+    assert "--full-auto" not in argv
+    assert "--sandbox=workspace-write" not in argv
+    assert argv[-2:] == ["--sandbox", "read-only"]
+
+
+def test_claude_review_overrides_existing_bypass_permission_mode(tmp_path: Path) -> None:
+    agent = CommandAgent(
+        "claude",
+        AgentConfig(command=("claude", "-p", "--permission-mode", "bypassPermissions")),
+        cfg(tmp_path),
+    )
+    argv = agent.command_for_profile("review")
+    assert "bypassPermissions" not in argv
+    assert argv[-2:] == ["--permission-mode", "plan"]

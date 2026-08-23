@@ -79,8 +79,15 @@ Panel {
     }
   }
 
-  Process { id: stopProcess; onExited: root.refresh() }
-  Process { id: resumeProcess; onExited: root.refresh() }
+  Process {
+    id: stopProcess
+    onExited: root.refresh()
+  }
+
+  Process {
+    id: resumeProcess
+    onExited: root.refresh()
+  }
 
   IpcHandler {
     target: root.ipcTarget
@@ -138,6 +145,7 @@ Panel {
           spacing: Style.space(12)
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: "YOLO AGENT CONTROL"
             color: root.bar ? root.bar.foreground : Color.foreground
@@ -147,6 +155,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: root.stateLabel()
             color: Color.popups.text
@@ -160,6 +169,7 @@ Panel {
             height: Style.space(8)
             radius: height / 2
             color: Util.alpha(Color.popups.text, 0.18)
+
             Rectangle {
               height: parent.height
               width: parent.width * (root.totalCount > 0 ? root.completedCount / root.totalCount : 0)
@@ -169,8 +179,11 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
-            text: root.totalCount > 0 ? (root.completedCount + "/" + root.totalCount + " complete · " + root.runningCount + " running") : "No task graph loaded"
+            text: root.totalCount > 0
+              ? (root.completedCount + "/" + root.totalCount + " complete · " + root.runningCount + " running")
+              : "No task graph loaded"
             color: Util.alpha(Color.popups.text, 0.75)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
@@ -184,12 +197,15 @@ Panel {
               height: row.implicitHeight + Style.space(16)
               radius: Style.cornerRadius
               color: Util.alpha(Color.popups.text, 0.07)
+
               Row {
                 id: row
                 anchors.fill: parent
                 anchors.margins: Style.space(8)
                 spacing: Style.space(10)
+
                 Text {
+                  textFormat: Text.PlainText
                   width: Style.space(78)
                   text: String(modelData.logical_id) + "  " + String(modelData.state)
                   color: modelData.state === "failed" ? Color.urgent : Color.popups.text
@@ -197,7 +213,9 @@ Panel {
                   font.pixelSize: Style.font.caption
                   font.bold: modelData.state === "running"
                 }
+
                 Text {
+                  textFormat: Text.PlainText
                   width: row.width - Style.space(92)
                   text: String(modelData.title)
                   color: Color.popups.text
@@ -210,6 +228,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.lastError !== ""
             width: parent.width
             text: root.lastError
@@ -221,9 +240,21 @@ Panel {
 
           Row {
             spacing: Style.space(8)
-            Button { text: "Refresh"; onClicked: root.refresh() }
-            Button { visible: root.busy; text: "Stop"; onClicked: root.stopJob() }
-            Button { visible: root.jobState === "failed" || root.jobState === "stopped"; text: "Resume"; onClicked: root.resumeJob() }
+
+            Button {
+              text: "Refresh"
+              onClicked: root.refresh()
+            }
+            Button {
+              visible: root.busy
+              text: "Stop"
+              onClicked: root.stopJob()
+            }
+            Button {
+              visible: root.jobState === "failed" || root.jobState === "stopped"
+              text: "Resume"
+              onClicked: root.resumeJob()
+            }
           }
         }
       }
