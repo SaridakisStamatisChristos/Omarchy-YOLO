@@ -99,6 +99,26 @@ class GateRunner:
                         fh.write(b"\n[omarchy-yolo: gate log truncated]\n")
                     log_truncated = True
 
+        async def pump(
+            stream: asyncio.StreamReader | None,
+            target: bytearray,
+            process: asyncio.subprocess.Process,
+        ) -> None:
+            if stream is None:
+                return
+            try:
+                while True:
+                    chunk = await stream.read(65536)
+                    if not chunk:
+                        break
+                    target.extend(chunk)
+                    if len(target) > self.capture_limit_bytes:
+                        del target[: len(target) - self.capture_limit_bytes]
+                    await write_log(chunk)
+            except (OSError, YoloError):
+                await self._terminate_group(process)
+                raise
+
         for command in commands:
             started = time.monotonic()
             await write_log(f"\n$ {command}\n".encode())
@@ -123,25 +143,8 @@ class GateRunner:
             )
             stdout_b = bytearray()
             stderr_b = bytearray()
-
-            async def pump(stream: asyncio.StreamReader | None, target: bytearray) -> None:
-                if stream is None:
-                    return
-                try:
-                    while True:
-                        chunk = await stream.read(65536)
-                        if not chunk:
-                            break
-                        target.extend(chunk)
-                        if len(target) > self.capture_limit_bytes:
-                            del target[: len(target) - self.capture_limit_bytes]
-                        await write_log(chunk)
-                except (OSError, YoloError):
-                    await self._terminate_group(proc)
-                    raise
-
-            stdout_task = asyncio.create_task(pump(proc.stdout, stdout_b))
-            stderr_task = asyncio.create_task(pump(proc.stderr, stderr_b))
+            stdout_task = asyncio.create_task(pump(proc.stdout, stdout_b, proc))
+            stderr_task = asyncio.create_task(pump(proc.stderr, stderr_b, proc))
             timed_out = False
             pump_results: list[object] = []
             try:
