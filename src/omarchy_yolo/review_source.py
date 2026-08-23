@@ -5,6 +5,7 @@ import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from .git import GitRepo
 from .util import YoloError
@@ -46,7 +47,7 @@ def _git_text(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> str:
         start_new_session=True,
     )
     assert proc.stdout is not None
-    data = proc.stdout.read(max_bytes + 1)
+    data = cast(bytes, proc.stdout.read(max_bytes + 1))
     truncated = len(data) > max_bytes
     if truncated and proc.poll() is None:
         try:
