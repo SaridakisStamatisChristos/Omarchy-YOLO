@@ -16,7 +16,7 @@ from .util import YoloError, truncate_utf8
 
 DOSSIER_SCHEMA_VERSION = 1
 MAX_DOSSIER_BYTES = 512_000
-_SELF_REFERENTIAL_EVENT_KINDS = frozenset({"job.dossier_created"})
+_DOSSIER_BOUNDARY_EVENT = "job.dossier_created"
 
 
 def canonical_json(value: object) -> str:
@@ -37,12 +37,10 @@ def verify_dossier(content: str, expected_sha256: str) -> bool:
 
 
 def _event_digest(events: list[dict[str, Any]]) -> tuple[str, dict[str, int], int, int]:
-    """Hash the durable event prefix that logically precedes dossier creation.
+    """Hash the durable event prefix immediately preceding dossier publication.
 
-    The dossier-created event contains the dossier digest, so including it would make
-    deterministic regeneration mathematically self-referential. We therefore exclude
-    only explicitly named provenance bookkeeping events and record both the hashed
-    event count and last included event id.
+    Once a prior dossier boundary exists, later completion/cleanup events are outside
+    the accepted-input prefix and must not perturb deterministic regeneration.
     """
 
     digest = hashlib.sha256()
@@ -51,8 +49,8 @@ def _event_digest(events: list[dict[str, Any]]) -> tuple[str, dict[str, int], in
     last_event_id = 0
     for event in events:
         kind = str(event["kind"])
-        if kind in _SELF_REFERENTIAL_EVENT_KINDS:
-            continue
+        if kind == _DOSSIER_BOUNDARY_EVENT:
+            break
         kinds[kind] += 1
         digest.update(canonical_json(event).encode("utf-8"))
         digest.update(b"\n")
@@ -122,7 +120,7 @@ def build_dossier(
     job_id: str,
     final_commit: str,
     final_summary: str,
-    source_apply_outcome: str,
+    source_apply_intent: str,
 ) -> tuple[str, str]:
     job = db.get_job(job_id)
     snapshot = db.provenance_snapshot(job_id)
@@ -192,7 +190,7 @@ def build_dossier(
             "integration_branch": job.integration_branch,
             "final_commit": final_commit,
             "auto_apply": job.auto_apply,
-            "source_apply_outcome": source_apply_outcome,
+            "source_apply_intent": source_apply_intent,
             "accepted_state": JobState.COMPLETED.value,
             "created_at": job.created_at,
             "accepted_summary": _summary_fingerprint(final_summary),
@@ -207,7 +205,7 @@ def build_dossier(
             "sha256": event_sha256,
             "kinds": event_kinds,
             "last_event_id": last_event_id,
-            "excluded_kinds": sorted(_SELF_REFERENTIAL_EVENT_KINDS),
+            "boundary_event": _DOSSIER_BOUNDARY_EVENT,
         },
     }
     content = canonical_json(payload)
