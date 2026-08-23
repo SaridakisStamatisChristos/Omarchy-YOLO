@@ -36,3 +36,10 @@ jobs:
         run: ./scripts/check.sh
       - name: Build wheel without dependency resolution
         run: python -m pip wheel . --no-deps --no-build-isolation -w dist
+      - name: Verify built wheel in clean environment
+        run: |
+          python -m venv /tmp/omarchy-yolo-wheel
+          /tmp/omarchy-yolo-wheel/bin/python -m pip install --no-deps dist/omarchy_yolo-*.whl
+          /tmp/omarchy-yolo-wheel/bin/python -c 'import omarchy_yolo; print(omarchy_yolo.__version__)'
+          /tmp/omarchy-yolo-wheel/bin/yolo --version
+          /tmp/omarchy-yolo-wheel/bin/python -m omarchy_yolo --version
