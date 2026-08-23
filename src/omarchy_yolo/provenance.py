@@ -16,6 +16,7 @@ from .util import YoloError, truncate_utf8
 
 DOSSIER_SCHEMA_VERSION = 1
 MAX_DOSSIER_BYTES = 512_000
+_SELF_REFERENTIAL_EVENT_KINDS = frozenset({"job.dossier_created"})
 
 
 def canonical_json(value: object) -> str:
@@ -35,14 +36,29 @@ def verify_dossier(content: str, expected_sha256: str) -> bool:
     return sha256_text(content) == expected_sha256
 
 
-def _event_digest(events: list[dict[str, Any]]) -> tuple[str, dict[str, int]]:
+def _event_digest(events: list[dict[str, Any]]) -> tuple[str, dict[str, int], int, int]:
+    """Hash the durable event prefix that logically precedes dossier creation.
+
+    The dossier-created event contains the dossier digest, so including it would make
+    deterministic regeneration mathematically self-referential. We therefore exclude
+    only explicitly named provenance bookkeeping events and record both the hashed
+    event count and last included event id.
+    """
+
     digest = hashlib.sha256()
     kinds: Counter[str] = Counter()
+    included = 0
+    last_event_id = 0
     for event in events:
-        kinds[str(event["kind"])] += 1
+        kind = str(event["kind"])
+        if kind in _SELF_REFERENTIAL_EVENT_KINDS:
+            continue
+        kinds[kind] += 1
         digest.update(canonical_json(event).encode("utf-8"))
         digest.update(b"\n")
-    return digest.hexdigest(), dict(sorted(kinds.items()))
+        included += 1
+        last_event_id = int(event["id"])
+    return digest.hexdigest(), dict(sorted(kinds.items())), included, last_event_id
 
 
 def _summary_fingerprint(value: str) -> dict[str, object]:
@@ -119,7 +135,7 @@ def build_dossier(
         (TaskState(str(task["state"])) for task in tasks),
         stop_requested=False,
     )
-    event_sha256, event_kinds = _event_digest(events)
+    event_sha256, event_kinds, event_count, last_event_id = _event_digest(events)
 
     compact_tasks = [
         {
@@ -187,10 +203,11 @@ def build_dossier(
         "tasks": compact_tasks,
         "attempts": compact_attempts,
         "event_ledger": {
-            "count": len(events),
+            "count": event_count,
             "sha256": event_sha256,
             "kinds": event_kinds,
-            "last_event_id": int(events[-1]["id"]) if events else 0,
+            "last_event_id": last_event_id,
+            "excluded_kinds": sorted(_SELF_REFERENTIAL_EVENT_KINDS),
         },
     }
     content = canonical_json(payload)
