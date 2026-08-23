@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from .config import Config
     from .db import Database
     from .reviewer import Reviewer
+    from .runtime import ResourceCoordinator
 
 
 class TaskExecutionMixin:
@@ -23,6 +24,7 @@ class TaskExecutionMixin:
         db: Database
         registry: AgentRegistry
         reviewer: Reviewer
+        coordinator: ResourceCoordinator
         _merge_lock: asyncio.Lock
 
         async def _run_gates(
@@ -50,6 +52,16 @@ class TaskExecutionMixin:
         repo: GitRepo,
         integration_path: Path,
     ) -> bool:
+        async with self.coordinator.worker_slot():
+            return await self._run_task_with_slot(job_id, task_id, repo, integration_path)
+
+    async def _run_task_with_slot(
+        self,
+        job_id: str,
+        task_id: str,
+        repo: GitRepo,
+        integration_path: Path,
+    ) -> bool:
         task = self.db.get_task(task_id)
         job = self.db.get_job(job_id)
         retry_context = task.last_error
@@ -68,18 +80,16 @@ class TaskExecutionMixin:
             branch = task.branch
             base_commit = task.base_commit
         elif task.branch and branch_exists:
-            # Recovery path: keep durable commits on the task branch even if the worktree directory
-            # vanished or its registration went stale. Reattaching is safer than recreating the
-            # branch from integration and silently discarding progress.
             branch = task.branch
             base_commit = task.base_commit or await asyncio.to_thread(repo.head, integration_path)
             worktree = stored_worktree or (
                 self.config.worktrees_dir / job_id / f"task-{task.seq}-{slug(task.logical_id)}"
             )
             async with self._merge_lock:
-                await asyncio.to_thread(
-                    repo.ensure_existing_branch_worktree, worktree, branch, base_commit
-                )
+                async with self.coordinator.repo_lock(repo.root):
+                    await asyncio.to_thread(
+                        repo.ensure_existing_branch_worktree, worktree, branch, base_commit
+                    )
             self.db.update_task(task_id, worktree=str(worktree), base_commit=base_commit)
             self.db.event(
                 job_id,
@@ -89,10 +99,11 @@ class TaskExecutionMixin:
             )
         else:
             async with self._merge_lock:
-                base_commit = await asyncio.to_thread(repo.head, integration_path)
-                branch = f"{self.config.git.branch_prefix}/{job_id}/{slug(task.logical_id)}"
-                worktree = self.config.worktrees_dir / job_id / f"task-{task.seq}-{slug(task.logical_id)}"
-                await asyncio.to_thread(repo.ensure_worktree, worktree, branch, base_commit)
+                async with self.coordinator.repo_lock(repo.root):
+                    base_commit = await asyncio.to_thread(repo.head, integration_path)
+                    branch = f"{self.config.git.branch_prefix}/{job_id}/{slug(task.logical_id)}"
+                    worktree = self.config.worktrees_dir / job_id / f"task-{task.seq}-{slug(task.logical_id)}"
+                    await asyncio.to_thread(repo.ensure_worktree, worktree, branch, base_commit)
             self.db.update_task(
                 task_id,
                 branch=branch,
@@ -106,9 +117,6 @@ class TaskExecutionMixin:
                 task_id=task_id,
             )
 
-        # `max_attempts` is a budget per scheduling run, not a lifetime cap. This lets an
-        # explicitly resumed failed task make fresh progress without deleting prior attempt history.
-        # Attempt numbers remain globally monotonic per task, satisfying the DB uniqueness invariant.
         first_attempt = task.attempts + 1
         last_attempt = task.attempts + self.config.engine.max_attempts
         for attempt_number in range(first_attempt, last_attempt + 1):
@@ -199,13 +207,24 @@ class TaskExecutionMixin:
 
             self.db.update_task(task_id, state=TaskState.REVIEWING)
             review = await self._review_task_resilient(
-                job_id, self.db.get_task(task_id), job.goal, repo, worktree, gate_results, attempt_number
+                job_id,
+                self.db.get_task(task_id),
+                job.goal,
+                repo,
+                worktree,
+                gate_results,
+                attempt_number,
             )
             if not review.passed:
                 retry_context = "Reviewer rejected the attempt:\n" + "\n".join(review.findings)
                 if review.summary:
                     retry_context += "\nSummary: " + review.summary
-                self.db.finish_attempt(attempt_id, state="failed", returncode=0, summary=retry_context[-4000:])
+                self.db.finish_attempt(
+                    attempt_id,
+                    state="failed",
+                    returncode=0,
+                    summary=retry_context[-4000:],
+                )
                 self.db.update_task(task_id, state=TaskState.PENDING, last_error=retry_context[-8000:])
                 self.db.event(
                     job_id,
@@ -220,7 +239,12 @@ class TaskExecutionMixin:
             )
             if not integrated:
                 retry_context = integration_feedback
-                self.db.finish_attempt(attempt_id, state="failed", returncode=1, summary=retry_context[-4000:])
+                self.db.finish_attempt(
+                    attempt_id,
+                    state="failed",
+                    returncode=1,
+                    summary=retry_context[-4000:],
+                )
                 self.db.update_task(task_id, state=TaskState.PENDING, last_error=retry_context[-8000:])
                 continue
 
@@ -243,8 +267,9 @@ class TaskExecutionMixin:
                 task_id=task_id,
             )
             if self.config.engine.cleanup_worktrees:
-                await asyncio.to_thread(repo.remove_worktree, worktree, force=True)
-                await asyncio.to_thread(repo.delete_branch, branch)
+                async with self.coordinator.repo_lock(repo.root):
+                    await asyncio.to_thread(repo.remove_worktree, worktree, force=True)
+                    await asyncio.to_thread(repo.delete_branch, branch)
             return True
 
         task = self.db.get_task(task_id)
@@ -289,7 +314,11 @@ class TaskExecutionMixin:
         errors: list[str] = []
         for candidate in candidates:
             try:
-                agent_name = self.registry.choose_role(candidate, self.config.engine.worker_agents)
+                agent_name = self.registry.choose_role(
+                    candidate,
+                    self.config.engine.worker_agents,
+                    execution_profile="review",
+                )
                 if agent_name in actual_tried:
                     continue
                 actual_tried.add(agent_name)

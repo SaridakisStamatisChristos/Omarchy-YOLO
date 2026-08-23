@@ -1,0 +1,20 @@
+# CI/development toolchain for Omarchy YOLO v1.1.
+# Runtime remains dependency-free. CI installs this file before the package with
+# --no-build-isolation --no-deps so quality-gate versions cannot drift silently.
+setuptools==84.0.0
+wheel==0.48.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+coverage==7.15.3
+ruff==0.16.4
+mypy==2.3.1
+ast-serialize==0.8.0
+librt==0.15.0
+typing-extensions==4.16.0
+mypy-extensions==1.1.0
+pathspec==1.1.1
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pygments==2.21.0

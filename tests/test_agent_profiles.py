@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from omarchy_yolo.agents.base import CommandAgent
 from omarchy_yolo.config import AgentConfig, Config
+from omarchy_yolo.util import YoloError
 
 
 def cfg(tmp_path: Path) -> Config:
@@ -28,6 +31,7 @@ def test_claude_review_profile_is_plan_mode(tmp_path: Path) -> None:
         cfg(tmp_path),
     )
     argv = agent.command_for_profile("review")
+    assert agent.supports_profile("review")
     assert "--dangerously-skip-permissions" not in argv
     assert argv[-2:] == ["--permission-mode", "plan"]
 
@@ -48,7 +52,6 @@ def test_opencode_review_profile_denies_mutation_and_external_access(tmp_path: P
     assert permission["bash"] == "deny"
     assert permission["external_directory"] == "deny"
     assert agent.command_for_profile("review")[-1] == "--auto"
-
 
 
 def test_codex_review_overrides_equals_style_sandbox_and_full_auto(tmp_path: Path) -> None:
@@ -72,3 +75,27 @@ def test_claude_review_overrides_existing_bypass_permission_mode(tmp_path: Path)
     argv = agent.command_for_profile("review")
     assert "bypassPermissions" not in argv
     assert argv[-2:] == ["--permission-mode", "plan"]
+
+
+def test_custom_agent_is_not_implicitly_trusted_for_review(tmp_path: Path) -> None:
+    agent = CommandAgent(
+        "custom",
+        AgentConfig(command=("custom-agent", "--yolo")),
+        cfg(tmp_path),
+    )
+    assert not agent.supports_profile("review")
+    with pytest.raises(YoloError, match="no declared read-only review capability"):
+        agent.command_for_profile("review")
+
+
+def test_custom_agent_can_declare_separate_review_command(tmp_path: Path) -> None:
+    agent = CommandAgent(
+        "custom",
+        AgentConfig(
+            command=("python", "--write"),
+            review_command=("python", "--read-only"),
+        ),
+        cfg(tmp_path),
+    )
+    assert agent.supports_profile("review")
+    assert agent.command_for_profile("review") == ["python", "--read-only"]

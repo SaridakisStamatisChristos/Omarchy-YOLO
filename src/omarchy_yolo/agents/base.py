@@ -12,12 +12,15 @@ from ..sandbox import Sandbox
 from ..util import YoloError, truncate_utf8
 
 MAX_PROMPT_ARG_BYTES = 120_000
+_BUILTIN_REVIEW_AGENTS = frozenset({"codex", "claude", "opencode"})
 
 
 class AgentLike(Protocol):
     name: str
 
     def available(self) -> bool: ...
+
+    def supports_profile(self, execution_profile: str) -> bool: ...
 
     async def run(
         self,
@@ -48,6 +51,18 @@ class CommandAgent:
     def available(self) -> bool:
         return bool(self.config.enabled and self.config.command and shutil.which(self.config.command[0]))
 
+    def _trusted_builtin_review_identity(self) -> bool:
+        if self.name not in _BUILTIN_REVIEW_AGENTS or not self.config.command:
+            return False
+        return Path(self.config.command[0]).name == self.name
+
+    def supports_profile(self, execution_profile: str) -> bool:
+        if execution_profile != "review":
+            return True
+        if self.config.review_command:
+            return bool(shutil.which(self.config.review_command[0]))
+        return self._trusted_builtin_review_identity()
+
     @staticmethod
     def _strip_option_with_value(argv: list[str], option: str) -> list[str]:
         result: list[str] = []
@@ -68,6 +83,13 @@ class CommandAgent:
     def command_for_profile(self, execution_profile: str) -> list[str]:
         argv = list(self.config.command)
         if execution_profile == "review":
+            if self.config.review_command:
+                return list(self.config.review_command)
+            if not self._trusted_builtin_review_identity():
+                raise YoloError(
+                    f"agent '{self.name}' has no declared read-only review capability; "
+                    "configure agents.<name>.review_command"
+                )
             if self.name == "codex":
                 argv = [
                     token
@@ -82,7 +104,12 @@ class CommandAgent:
                 argv = self._strip_option_with_value(argv, "--permission-mode")
                 argv.extend(["--permission-mode", "plan"])
                 return argv
-            return argv
+            if self.name == "opencode":
+                return argv
+            raise YoloError(
+                f"agent '{self.name}' has no declared read-only review capability; "
+                "configure agents.<name>.review_command"
+            )
 
         if execution_profile != "danger-yolo" or self.name != "codex":
             return argv
@@ -121,11 +148,20 @@ class CommandAgent:
     ) -> AgentResult:
         if not self.available():
             raise YoloError(f"agent '{self.name}' is not installed or disabled")
-        argv = self.sandbox.wrap(self.command_for_profile(execution_profile), cwd)
+        if not self.supports_profile(execution_profile):
+            raise YoloError(
+                f"agent '{self.name}' does not support execution profile '{execution_profile}'"
+            )
+        argv = self.sandbox.wrap(
+            self.command_for_profile(execution_profile),
+            cwd,
+            execution_profile=execution_profile,
+        )
         env = self.sandbox.environment()
-        env.update(self.environment_for_profile(execution_profile))
         if extra_env:
             env.update(extra_env)
+        # Safety policy wins over caller-supplied environment additions.
+        env.update(self.environment_for_profile(execution_profile))
         bounded_prompt = truncate_utf8(
             prompt,
             MAX_PROMPT_ARG_BYTES,

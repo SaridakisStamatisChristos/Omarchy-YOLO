@@ -1,0 +1,16 @@
+name: live-smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  omarchy-agent-smoke:
+    runs-on: [self-hosted, linux, omarchy-yolo-live]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run real-agent / Omarchy environment smoke
+        run: bash scripts/live-smoke.sh

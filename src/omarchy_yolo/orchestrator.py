@@ -14,6 +14,7 @@ from .orchestrator_integration import IntegrationMixin
 from .orchestrator_task import TaskExecutionMixin
 from .planner import Planner
 from .reviewer import Reviewer
+from .runtime import ResourceCoordinator
 from .util import YoloError, ensure_private_dir
 
 
@@ -29,6 +30,7 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         *,
         registry: AgentRegistry | None = None,
         gate_runner: GateRunner | None = None,
+        coordinator: ResourceCoordinator | None = None,
     ):
         self.config = config
         self.db = db
@@ -36,6 +38,7 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         self.gates = gate_runner or GateRunner()
         self.planner = Planner(self.registry, max_tasks=config.engine.max_tasks)
         self.reviewer = Reviewer(self.registry)
+        self.coordinator = coordinator or ResourceCoordinator(config.engine.max_global_workers)
         self._merge_lock = asyncio.Lock()
         self._active: set[asyncio.Task[bool]] = set()
 
@@ -45,24 +48,30 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         job_root = ensure_private_dir(self.config.worktrees_dir / job_id)
         integration_path = job_root / "integration"
         try:
-            await asyncio.to_thread(
-                repo.ensure_existing_branch_worktree,
-                integration_path,
-                job.integration_branch,
-                job.base_commit,
-            )
+            async with self.coordinator.repo_lock(repo.root):
+                await asyncio.to_thread(
+                    repo.ensure_existing_branch_worktree,
+                    integration_path,
+                    job.integration_branch,
+                    job.base_commit,
+                )
+                if await asyncio.to_thread(repo.merge_in_progress, integration_path):
+                    await asyncio.to_thread(repo.abort_merge, integration_path)
+                    self.db.event(job_id, "integration.recovered_merge_abort")
+                if not await asyncio.to_thread(repo.is_clean, integration_path):
+                    head = await asyncio.to_thread(repo.head, integration_path)
+                    await asyncio.to_thread(repo.reset_hard, integration_path, head)
+                    self.db.event(job_id, "integration.recovered_dirty_reset", {"head": head})
             self.db.update_job(job_id, integration_path=str(integration_path))
-            self.db.event(job_id, "integration.ready", {"path": str(integration_path), "branch": job.integration_branch})
-            if await asyncio.to_thread(repo.merge_in_progress, integration_path):
-                await asyncio.to_thread(repo.abort_merge, integration_path)
-                self.db.event(job_id, "integration.recovered_merge_abort")
-            if not await asyncio.to_thread(repo.is_clean, integration_path):
-                head = await asyncio.to_thread(repo.head, integration_path)
-                await asyncio.to_thread(repo.reset_hard, integration_path, head)
-                self.db.event(job_id, "integration.recovered_dirty_reset", {"head": head})
+            self.db.event(
+                job_id,
+                "integration.ready",
+                {"path": str(integration_path), "branch": job.integration_branch},
+            )
 
             if not self.db.list_tasks(job_id):
-                await self._plan_job(job_id, integration_path)
+                async with self.coordinator.worker_slot():
+                    await self._plan_job(job_id, integration_path)
 
             self.db.update_job(job_id, state=JobState.RUNNING)
             self.db.event(job_id, "job.running")
@@ -71,16 +80,18 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             if self.db.get_job(job_id).stop_requested:
                 raise asyncio.CancelledError
 
-            final_summary = await self._finalize(job_id, repo, integration_path)
+            async with self.coordinator.worker_slot():
+                final_summary = await self._finalize(job_id, repo, integration_path)
             job = self.db.get_job(job_id)
             if job.auto_apply:
                 try:
-                    await asyncio.to_thread(
-                        repo.fast_forward_source,
-                        job.integration_branch,
-                        job.base_branch,
-                        job.base_commit,
-                    )
+                    async with self.coordinator.repo_lock(repo.root):
+                        await asyncio.to_thread(
+                            repo.fast_forward_source,
+                            job.integration_branch,
+                            job.base_branch,
+                            job.base_commit,
+                        )
                     self.db.event(job_id, "job.applied", {"branch": job.base_branch})
                 except GitError as exc:
                     self.db.event(job_id, "job.apply_skipped", {"reason": str(exc)})
@@ -99,7 +110,17 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             notify("YOLO completed", f"{Path(job.repo).name}: {job.integration_branch}")
 
             if self.config.engine.cleanup_worktrees:
-                await self._cleanup_completed(repo, job_id, integration_path)
+                try:
+                    await self._cleanup_completed(repo, job_id, integration_path)
+                except Exception as exc:
+                    # Cleanup is post-release housekeeping. Once the candidate has passed all
+                    # gates/review and the job is durably completed, a stale worktree must not
+                    # rewrite that completed result to FAILED.
+                    self.db.event(
+                        job_id,
+                        "job.cleanup_failed",
+                        {"error": str(exc)[-4_000:]},
+                    )
         except asyncio.CancelledError:
             await self._cancel_active()
             current = self.db.get_job(job_id)
@@ -141,7 +162,9 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         self.db.update_job(job_id, state=JobState.PLANNING)
         self.db.event(job_id, "planner.started")
         planner_name = self.registry.choose_role(
-            self.config.engine.planner_agent, self.config.engine.worker_agents
+            self.config.engine.planner_agent,
+            self.config.engine.worker_agents,
+            execution_profile="review",
         )
         log_path = self.config.logs_dir / job_id / "planner.log"
         try:
@@ -152,9 +175,12 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                 timeout_seconds=self.config.engine.agent_timeout_seconds,
                 log_path=log_path,
             )
-            self.db.event(job_id, "planner.completed", {"agent": planner_name, "summary": summary, "tasks": len(tasks)})
+            self.db.event(
+                job_id,
+                "planner.completed",
+                {"agent": planner_name, "summary": summary, "tasks": len(tasks)},
+            )
         except Exception as exc:
-            # Autonomous degradation: a malformed/failed planner should not brick the entire run.
             tasks = [
                 PlannedTask(
                     logical_id="T1",
@@ -227,4 +253,3 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                     task_id = handle.get_name()
                     failed = self.db.get_task(task_id)
                     raise TaskExecutionError(f"{failed.logical_id} failed: {failed.last_error}")
-

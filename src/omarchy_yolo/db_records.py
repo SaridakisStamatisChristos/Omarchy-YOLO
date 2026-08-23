@@ -56,20 +56,20 @@ class RecordsMixin(DatabaseCore):
         return self.get_job(job_id)
 
     def get_job(self, job_id: str) -> JobRecord:
-        row = self._execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        row = self._fetchone("SELECT * FROM jobs WHERE id = ?", (job_id,))
         if row is None:
             raise KeyError(job_id)
         return self._job_from_row(row)
 
     def latest_job(self) -> JobRecord | None:
-        row = self._execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+        row = self._fetchone("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1")
         return self._job_from_row(row) if row is not None else None
 
     def list_jobs(self, limit: int = 50) -> list[JobRecord]:
         bounded = min(MAX_JOB_LIST_LIMIT, max(1, limit))
-        rows = self._execute(
+        rows = self._fetchall(
             "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (bounded,)
-        ).fetchall()
+        )
         return [self._job_from_row(row) for row in rows]
 
     def update_job(self, job_id: str, **fields: Any) -> None:
@@ -136,21 +136,21 @@ class RecordsMixin(DatabaseCore):
         return self.list_tasks(job_id)
 
     def list_tasks(self, job_id: str) -> list[TaskRecord]:
-        rows = self._execute(
+        rows = self._fetchall(
             "SELECT * FROM tasks WHERE job_id = ? ORDER BY seq", (job_id,)
-        ).fetchall()
+        )
         return [self._task_from_row(row) for row in rows]
 
     def get_task(self, task_id: str) -> TaskRecord:
-        row = self._execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = self._fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
         if row is None:
             raise KeyError(task_id)
         return self._task_from_row(row)
 
     def get_task_by_logical_id(self, job_id: str, logical_id: str) -> TaskRecord:
-        row = self._execute(
+        row = self._fetchone(
             "SELECT * FROM tasks WHERE job_id = ? AND logical_id = ?", (job_id, logical_id)
-        ).fetchone()
+        )
         if row is None:
             raise KeyError((job_id, logical_id))
         return self._task_from_row(row)
@@ -245,13 +245,13 @@ class RecordsMixin(DatabaseCore):
 
     def events(self, job_id: str, *, after_id: int = 0, limit: int = 200) -> list[dict[str, Any]]:
         bounded = min(MAX_EVENT_LIST_LIMIT, max(1, limit))
-        rows = self._execute(
+        rows = self._fetchall(
             """
             SELECT id, job_id, task_id, kind, payload, created_at
             FROM events WHERE job_id = ? AND id > ? ORDER BY id LIMIT ?
             """,
             (job_id, max(0, after_id), bounded),
-        ).fetchall()
+        )
         return [
             {
                 "id": int(row["id"]),
@@ -265,7 +265,9 @@ class RecordsMixin(DatabaseCore):
         ]
 
     def last_event_id(self, job_id: str) -> int:
-        row = self._execute("SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE job_id = ?", (job_id,)).fetchone()
+        row = self._fetchone(
+            "SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE job_id = ?", (job_id,)
+        )
         return int(row["id"]) if row is not None else 0
 
     def request_stop(self, job_id: str) -> None:
@@ -275,4 +277,3 @@ class RecordsMixin(DatabaseCore):
     def clear_stop(self, job_id: str) -> None:
         self.update_job(job_id, stop_requested=False, state=JobState.QUEUED, error="")
         self.event(job_id, "job.resumed")
-

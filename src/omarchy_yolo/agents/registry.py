@@ -22,21 +22,52 @@ class AgentRegistry:
         except KeyError as exc:
             raise YoloError(f"unknown agent '{name}'") from exc
 
-    def available(self) -> list[str]:
-        return [name for name, agent in self._agents.items() if agent.available()]
+    @staticmethod
+    def _supports(agent: AgentLike, execution_profile: str | None) -> bool:
+        if execution_profile is None:
+            return True
+        return agent.supports_profile(execution_profile)
 
-    def first_available(self, preferred: Iterable[str]) -> str:
+    def available(self, execution_profile: str | None = None) -> list[str]:
+        return [
+            name
+            for name, agent in self._agents.items()
+            if agent.available() and self._supports(agent, execution_profile)
+        ]
+
+    def first_available(
+        self,
+        preferred: Iterable[str],
+        *,
+        execution_profile: str | None = None,
+    ) -> str:
         for name in preferred:
             agent = self._agents.get(name)
-            if agent is not None and agent.available():
+            if (
+                agent is not None
+                and agent.available()
+                and self._supports(agent, execution_profile)
+            ):
                 return name
-        available = self.available()
+        available = self.available(execution_profile)
         if not available:
+            if execution_profile == "review":
+                raise YoloError("no configured agent has a declared read-only review capability")
             raise YoloError("no configured coding agent CLI is available")
         return available[0]
 
-    def choose_role(self, configured: str, fallbacks: Iterable[str]) -> str:
+    def choose_role(
+        self,
+        configured: str,
+        fallbacks: Iterable[str],
+        *,
+        execution_profile: str | None = None,
+    ) -> str:
         agent = self._agents.get(configured)
-        if agent is not None and agent.available():
+        if (
+            agent is not None
+            and agent.available()
+            and self._supports(agent, execution_profile)
+        ):
             return configured
-        return self.first_available(fallbacks)
+        return self.first_available(fallbacks, execution_profile=execution_profile)
