@@ -20,7 +20,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install test dependencies
-        run: python -m pip install --upgrade pip pytest pytest-asyncio
+      - name: Install package and development checks
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check src tests
+      - name: Mypy
+        run: python -m mypy src/omarchy_yolo
       - name: Verify source, shell artifacts, and tests
         run: ./scripts/check.sh
