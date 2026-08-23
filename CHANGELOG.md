@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0 - 2026-08-23
+
+- Add a daemon-wide worker semaphore so multiple jobs share one global execution budget instead of multiplying `max_parallel` per job.
+- Add canonical per-repository async locks for worktree topology, integration merges, cleanup, preflight, and source application across concurrent jobs.
+- Replace the old bounded single-diff final audit with fail-closed hierarchical review: every changed file is enumerated, split into bounded shards, reviewed, then synthesized for cross-file defects.
+- Refuse finalization when file count, per-file diff size, total review size, or synthesis manifest limits are exceeded instead of silently truncating review coverage.
+- Require an explicit read-only capability for planner/reviewer agents; custom adapters must declare `review_command` rather than inheriting their mutating worker command.
+- Force Bubblewrap planner/reviewer HOME read-only and allow worker mode to expose only explicitly configured writable HOME subpaths when desired.
+- Expose daemon-wide runtime utilization in status/RPC responses.
+- Hold SQLite reads through row fetch completion and run `PRAGMA quick_check` at state initialization so corrupt databases fail closed with a clear error.
+- Make process logging fail safely under storage errors: the durable log is opened before spawning a child, and stream-write failures terminate the process group.
+- Pin GitHub Actions revisions and the CI/development Python toolchain; build wheels without dependency re-resolution.
+- Add branch-coverage enforcement, global-scheduler tests, hierarchical-review coverage tests, corrupt-database and interrupted-merge failure injection, and ENOSPC process-launch regression coverage.
+- Add an opt-in self-hosted `live-smoke` workflow for real Codex/Claude/OpenCode and Omarchy environments without making proprietary CLIs a normal PR dependency.
+
 ## 1.0.1 - 2026-08-23
 
 - Repair the live GitHub database schema/recovery corruption that could prevent fresh daemon startup.
