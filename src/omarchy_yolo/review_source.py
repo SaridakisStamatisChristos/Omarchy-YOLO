@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,13 +23,54 @@ class ReviewChunk:
 
 def _git_text(repo: GitRepo, cwd: Path, args: list[str], max_bytes: int) -> str:
     repo.assert_worktree(cwd)
-    text, truncated = repo._run_stdout_bounded(args, cwd=cwd, max_bytes=max_bytes)
+    argv = [
+        "git",
+        "-C",
+        str(cwd),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        *args,
+    ]
+    env = os.environ.copy()
+    env.setdefault("GIT_PAGER", "cat")
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    data = proc.stdout.read(max_bytes + 1)
+    truncated = len(data) > max_bytes
+    if truncated and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
     if truncated:
         raise YoloError(
             f"candidate review data exceeds the safety ceiling ({max_bytes} bytes); "
             "split the change into smaller tasks"
         )
-    return text
+    if proc.returncode != 0:
+        raise YoloError(
+            f"Git review query failed with exit {proc.returncode}: {' '.join(args[:4])}"
+        )
+    return data.decode("utf-8", errors="replace")
 
 
 def changed_files(repo: GitRepo, cwd: Path, base: str, *, max_files: int) -> list[str]:
