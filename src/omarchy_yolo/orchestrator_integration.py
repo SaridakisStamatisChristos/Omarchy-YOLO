@@ -3,16 +3,33 @@ from __future__ import annotations
 import asyncio
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from .gates import detect_gate_commands
 from .git import GitError, GitRepo, MergeConflict
-from .model import ReviewResult, TaskRecord, TaskState
+from .model import GateResult, ReviewResult, TaskRecord, TaskState
 from .prompts import INTEGRATION_REPAIR_TEMPLATE
 from .reviewer import format_gates
 from .util import YoloError
-from .gates import detect_gate_commands
+
+if TYPE_CHECKING:
+    from .agents import AgentRegistry
+    from .config import Config
+    from .db import Database
+    from .gates import GateRunner
+    from .reviewer import Reviewer
 
 
 class IntegrationMixin:
+    if TYPE_CHECKING:
+        config: Config
+        db: Database
+        registry: AgentRegistry
+        reviewer: Reviewer
+        gates: GateRunner
+        _merge_lock: asyncio.Lock
+        _active: set[asyncio.Task[bool]]
+
     async def _integrate_task(
         self,
         job_id: str,
@@ -151,7 +168,7 @@ class IntegrationMixin:
         *,
         final: bool,
         suffix: str = "worker",
-    ) -> list[object]:
+    ) -> list[GateResult]:
         configured = self.config.gates.final_commands if final else self.config.gates.commands
         commands = configured or detect_gate_commands(cwd)
         label = "final" if final else (task.logical_id if task else "job")
@@ -167,8 +184,8 @@ class IntegrationMixin:
             "gates.completed",
             {
                 "scope": label,
-                "commands": [getattr(result, "command", "") for result in results],
-                "ok": all(getattr(result, "ok", False) for result in results),
+                "commands": [result.command for result in results],
+                "ok": all(result.ok for result in results),
             },
             task_id=task.id if task else None,
         )
@@ -183,7 +200,7 @@ class IntegrationMixin:
 
         for cycle in range(0, self.config.engine.max_final_cycles + 1):
             gates = await self._run_gates(job_id, None, integration_path, final=True, suffix=f"cycle-{cycle}")
-            if not all(getattr(result, "ok", False) for result in gates):
+            if not all(result.ok for result in gates):
                 issue = "Final repository gates failed:\n" + format_gates(gates)
                 if cycle >= self.config.engine.max_final_cycles:
                     raise YoloError(issue)

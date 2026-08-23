@@ -4,7 +4,7 @@ import json
 from collections.abc import Iterable
 from typing import Any
 
-from .db_core import DatabaseCore, MAX_EVENT_LIST_LIMIT, MAX_EVENT_PAYLOAD_CHARS, MAX_JOB_LIST_LIMIT
+from .db_core import MAX_EVENT_LIST_LIMIT, MAX_EVENT_PAYLOAD_CHARS, MAX_JOB_LIST_LIMIT, DatabaseCore
 from .model import JobRecord, JobState, PlannedTask, TaskRecord, TaskState
 from .util import json_dumps, new_id, utc_ts
 
@@ -94,7 +94,7 @@ class RecordsMixin(DatabaseCore):
                 values[key] = int(bool(values[key]))
         values["updated_at"] = utc_ts()
         assignments = ", ".join(f"{key} = ?" for key in values)
-        params = tuple(values.values()) + (job_id,)
+        params = (*values.values(), job_id)
         self._execute(f"UPDATE jobs SET {assignments} WHERE id = ?", params)
 
     def add_tasks(self, job_id: str, planned: Iterable[PlannedTask]) -> list[TaskRecord]:
@@ -176,7 +176,7 @@ class RecordsMixin(DatabaseCore):
             values["state"] = values["state"].value
         values["updated_at"] = utc_ts()
         assignments = ", ".join(f"{key} = ?" for key in values)
-        params = tuple(values.values()) + (task_id,)
+        params = (*values.values(), task_id)
         self._execute(f"UPDATE tasks SET {assignments} WHERE id = ?", params)
 
     def start_attempt(
@@ -238,7 +238,10 @@ class RecordsMixin(DatabaseCore):
             "INSERT INTO events(job_id, task_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
             (job_id, task_id, kind[:128], encoded_payload, utc_ts()),
         )
-        return int(cur.lastrowid)
+        rowid = cur.lastrowid
+        if rowid is None:
+            raise RuntimeError("SQLite did not return an event row id")
+        return rowid
 
     def events(self, job_id: str, *, after_id: int = 0, limit: int = 200) -> list[dict[str, Any]]:
         bounded = min(MAX_EVENT_LIST_LIMIT, max(1, limit))

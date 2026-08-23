@@ -151,8 +151,10 @@ class CommandAgent:
         if self.name == "claude":
             try:
                 value = json.loads(stdout)
-                if isinstance(value, dict) and isinstance(value.get("result"), str):
-                    return value["result"]
+                if isinstance(value, dict):
+                    result = value.get("result")
+                    if isinstance(result, str):
+                        return result
             except json.JSONDecodeError:
                 return stdout
         if self.name == "opencode":

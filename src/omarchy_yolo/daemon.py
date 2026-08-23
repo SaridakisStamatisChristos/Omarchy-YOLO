@@ -174,10 +174,17 @@ class YoloDaemon:
     def _bounded_int(value: object, *, default: int, minimum: int, maximum: int, name: str) -> int:
         if value is None:
             return default
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError) as exc:
-            raise YoloError(f"{name} must be an integer") from exc
+        if isinstance(value, bool):
+            raise YoloError(f"{name} must be an integer")
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError as exc:
+                raise YoloError(f"{name} must be an integer") from exc
+        else:
+            raise YoloError(f"{name} must be an integer")
         return min(maximum, max(minimum, parsed))
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
@@ -320,12 +327,13 @@ class YoloDaemon:
         return self._status(job.id)
 
     def _status(self, job_id: object | None) -> dict[str, Any]:
+        job: JobRecord | None
         if job_id:
             job = self.db.get_job(str(job_id))
         else:
             job = self.db.latest_job()
-            if job is None:
-                return {"job": None, "tasks": [], "counts": {}}
+        if job is None:
+            return {"job": None, "tasks": [], "counts": {}}
         tasks = self.db.list_tasks(job.id)
         counts: dict[str, int] = {}
         for task in tasks:

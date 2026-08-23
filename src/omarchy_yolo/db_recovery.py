@@ -1,11 +1,28 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 from .db_core import DatabaseCore
 from .model import JobState, TaskState
+
+if TYPE_CHECKING:
+    from .model import JobRecord
 from .util import utc_ts
 
 
 class RecoveryMixin(DatabaseCore):
+    if TYPE_CHECKING:
+        def get_job(self, job_id: str) -> JobRecord: ...
+
+        def event(
+            self,
+            job_id: str,
+            kind: str,
+            payload: dict[str, Any] | None = None,
+            *,
+            task_id: str | None = None,
+        ) -> int: ...
+
     def retry_failed_tasks(self, job_id: str) -> None:
         """Compatibility helper: make all non-completed task states schedulable again."""
         now = utc_ts()

@@ -2,15 +2,47 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .git import GitRepo
-from .model import ReviewResult, TaskRecord, TaskState
+from .model import GateResult, ReviewResult, TaskRecord, TaskState
 from .prompts import worker_prompt
 from .reviewer import format_gates
 from .util import YoloError, slug
 
+if TYPE_CHECKING:
+    from .agents import AgentRegistry
+    from .config import Config
+    from .db import Database
+    from .reviewer import Reviewer
+
 
 class TaskExecutionMixin:
+    if TYPE_CHECKING:
+        config: Config
+        db: Database
+        registry: AgentRegistry
+        reviewer: Reviewer
+        _merge_lock: asyncio.Lock
+
+        async def _run_gates(
+            self,
+            job_id: str,
+            task: TaskRecord | None,
+            cwd: Path,
+            *,
+            final: bool,
+            suffix: str = "worker",
+        ) -> list[GateResult]: ...
+
+        async def _integrate_task(
+            self,
+            job_id: str,
+            task: TaskRecord,
+            repo: GitRepo,
+            integration_path: Path,
+        ) -> tuple[bool, str]: ...
+
     async def _run_task(
         self,
         job_id: str,
@@ -247,7 +279,7 @@ class TaskExecutionMixin:
         goal: str,
         repo: GitRepo,
         worktree: Path,
-        gates: list[object],
+        gates: list[GateResult],
         attempt_number: int,
     ) -> ReviewResult:
         diff = await asyncio.to_thread(repo.diff, worktree, task.base_commit)

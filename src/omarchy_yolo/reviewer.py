@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .agents import AgentRegistry
-from .model import ReviewResult, TaskRecord
+from .model import GateResult, ReviewResult, TaskRecord
 from .prompts import FINAL_REVIEW_TEMPLATE, REVIEW_TEMPLATE
 from .util import YoloError, extract_json_object, truncate_utf8
 
@@ -13,7 +13,7 @@ MAX_REVIEW_FINDING_CHARS = 4_000
 MAX_GATE_SUMMARY_BYTES = 16_000
 
 
-def format_gates(results: list[object]) -> str:
+def format_gates(results: list[GateResult]) -> str:
     lines: list[str] = []
     for result in results:
         command = getattr(result, "command", "?")
@@ -35,7 +35,7 @@ class Reviewer:
         goal: str,
         task: TaskRecord,
         diff: str,
-        gates: list[object],
+        gates: list[GateResult],
         cwd: Path,
         agent_name: str,
         timeout_seconds: int,
@@ -54,7 +54,7 @@ class Reviewer:
         *,
         goal: str,
         diff: str,
-        gates: list[object],
+        gates: list[GateResult],
         cwd: Path,
         agent_name: str,
         timeout_seconds: int,
