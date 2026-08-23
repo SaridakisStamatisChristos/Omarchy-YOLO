@@ -9,7 +9,11 @@ import time
 from pathlib import Path
 
 from .model import GateResult
-from .util import ensure_private_dir
+from .util import YoloError, ensure_private_dir, open_private_binary, read_text_bounded
+
+
+CAPTURE_LIMIT_BYTES = 200_000
+LOG_LIMIT_BYTES = 64_000_000
 
 
 def detect_gate_commands(repo: Path) -> tuple[str, ...]:
@@ -24,7 +28,7 @@ def detect_gate_commands(repo: Path) -> tuple[str, ...]:
     package_json = repo / "package.json"
     if package_json.exists():
         try:
-            package = json.loads(package_json.read_text())
+            package = json.loads(read_text_bounded(package_json, max_bytes=2_000_000))
             scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
             test_script = scripts.get("test", "") if isinstance(scripts, dict) else ""
             if test_script and "no test specified" not in str(test_script):
@@ -32,7 +36,7 @@ def detect_gate_commands(repo: Path) -> tuple[str, ...]:
                 if (repo / "yarn.lock").exists():
                     manager = "yarn"
                 commands.append(f"{manager} test")
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, YoloError):
             pass
 
     if (repo / "Cargo.toml").exists():
@@ -42,10 +46,10 @@ def detect_gate_commands(repo: Path) -> tuple[str, ...]:
     makefile = repo / "Makefile"
     if makefile.exists():
         try:
-            content = makefile.read_text(errors="ignore")
+            content = read_text_bounded(makefile, max_bytes=1_000_000, errors="ignore")
             if re.search(r"(?m)^test\s*:", content) and "make test" not in commands:
                 commands.append("make test")
-        except OSError:
+        except (OSError, YoloError):
             pass
     if (repo / "build").is_dir() and (repo / "build/CTestTestfile.cmake").exists():
         commands.append("ctest --test-dir build --output-on-failure")
@@ -54,6 +58,10 @@ def detect_gate_commands(repo: Path) -> tuple[str, ...]:
 
 
 class GateRunner:
+    def __init__(self, *, capture_limit_bytes: int = CAPTURE_LIMIT_BYTES, log_limit_bytes: int = LOG_LIMIT_BYTES):
+        self.capture_limit_bytes = max(1, capture_limit_bytes)
+        self.log_limit_bytes = max(1, log_limit_bytes)
+
     async def run(
         self,
         commands: tuple[str, ...],
@@ -64,8 +72,40 @@ class GateRunner:
     ) -> list[GateResult]:
         results: list[GateResult] = []
         ensure_private_dir(log_path.parent)
+        with open_private_binary(log_path):
+            pass
+        logged_bytes = 0
+        log_truncated = False
+        log_lock = asyncio.Lock()
+
+        async def write_log(data: bytes) -> None:
+            nonlocal logged_bytes, log_truncated
+            async with log_lock:
+                if logged_bytes < self.log_limit_bytes:
+                    payload = data[: self.log_limit_bytes - logged_bytes]
+                    with open_private_binary(log_path, append=True) as fh:
+                        fh.write(payload)
+                    logged_bytes += len(payload)
+                elif not log_truncated:
+                    with open_private_binary(log_path, append=True) as fh:
+                        fh.write(b"\n[omarchy-yolo: gate log truncated]\n")
+                    log_truncated = True
+
+        async def pump(stream: asyncio.StreamReader | None, target: bytearray) -> None:
+            if stream is None:
+                return
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    break
+                target.extend(chunk)
+                if len(target) > self.capture_limit_bytes:
+                    del target[: len(target) - self.capture_limit_bytes]
+                await write_log(chunk)
+
         for command in commands:
             started = time.monotonic()
+            await write_log(f"\n$ {command}\n".encode())
             env = os.environ.copy()
             env.setdefault("CI", "1")
             proc = await asyncio.create_subprocess_exec(
@@ -78,51 +118,53 @@ class GateRunner:
                 env=env,
                 start_new_session=True,
             )
+            stdout_b = bytearray()
+            stderr_b = bytearray()
+            stdout_task = asyncio.create_task(pump(proc.stdout, stdout_b))
+            stderr_task = asyncio.create_task(pump(proc.stderr, stderr_b))
             timed_out = False
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout_seconds
-                )
+                await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
             except TimeoutError:
                 timed_out = True
-                stdout_b, stderr_b = await self._terminate_group(proc)
+                await self._terminate_group(proc)
             except asyncio.CancelledError:
                 await self._terminate_group(proc)
                 raise
+            finally:
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
             result = GateResult(
                 command=command,
                 returncode=proc.returncode if proc.returncode is not None else 124,
-                stdout=stdout_b.decode(errors="replace")[-200_000:],
-                stderr=stderr_b.decode(errors="replace")[-200_000:],
+                stdout=stdout_b.decode(errors="replace"),
+                stderr=stderr_b.decode(errors="replace"),
                 duration_seconds=time.monotonic() - started,
                 timed_out=timed_out,
             )
-            with log_path.open("a", encoding="utf-8") as fh:
-                fh.write(f"\n$ {command}\n")
-                fh.write(result.stdout)
-                if result.stderr:
-                    fh.write("\n[stderr]\n" + result.stderr)
-                fh.write(f"\n[exit={result.returncode} timeout={result.timed_out}]\n")
+            await write_log(
+                f"\n[exit={result.returncode} timeout={result.timed_out}]\n".encode()
+            )
             results.append(result)
             if not result.ok:
                 break
         return results
 
     @staticmethod
-    async def _terminate_group(
-        proc: asyncio.subprocess.Process,
-    ) -> tuple[bytes, bytes]:
+    async def _terminate_group(proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
-            return await proc.communicate()
+            return
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
-            return await proc.communicate()
+            return
         try:
-            return await asyncio.wait_for(proc.communicate(), timeout=5)
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            return
         except TimeoutError:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            return await proc.communicate()
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        await proc.wait()
