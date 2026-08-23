@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .model import AgentResult
-from .util import ensure_private_dir, open_private_binary, shell_join
+from .util import YoloError, ensure_private_dir, open_private_binary, shell_join
 
 
 class ProcessRunner:
@@ -82,7 +82,7 @@ class ProcessRunner:
                             with open_private_binary(log_path, append=True) as fh:
                                 fh.write(b"\n[omarchy-yolo: log output truncated]\n")
                             log_truncated = True
-            except OSError:
+            except (OSError, YoloError):
                 await self._terminate_group(proc)
                 raise
 
@@ -102,7 +102,7 @@ class ProcessRunner:
             pump_results = list(await asyncio.gather(out_task, err_task, return_exceptions=True))
 
         for pump_result in pump_results:
-            if isinstance(pump_result, OSError):
+            if isinstance(pump_result, (OSError, YoloError)):
                 raise pump_result
 
         rc = proc.returncode if proc.returncode is not None else 124
