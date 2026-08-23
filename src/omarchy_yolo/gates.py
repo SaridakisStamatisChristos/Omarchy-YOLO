@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .model import GateResult
+from .sandbox import Sandbox
 from .util import YoloError, ensure_private_dir, open_private_binary, read_text_bounded
 
 
@@ -58,9 +59,16 @@ def detect_gate_commands(repo: Path) -> tuple[str, ...]:
 
 
 class GateRunner:
-    def __init__(self, *, capture_limit_bytes: int = CAPTURE_LIMIT_BYTES, log_limit_bytes: int = LOG_LIMIT_BYTES):
+    def __init__(
+        self,
+        *,
+        capture_limit_bytes: int = CAPTURE_LIMIT_BYTES,
+        log_limit_bytes: int = LOG_LIMIT_BYTES,
+        sandbox: Sandbox | None = None,
+    ):
         self.capture_limit_bytes = max(1, capture_limit_bytes)
         self.log_limit_bytes = max(1, log_limit_bytes)
+        self.sandbox = sandbox
 
     async def run(
         self,
@@ -91,27 +99,22 @@ class GateRunner:
                         fh.write(b"\n[omarchy-yolo: gate log truncated]\n")
                     log_truncated = True
 
-        async def pump(stream: asyncio.StreamReader | None, target: bytearray) -> None:
-            if stream is None:
-                return
-            while True:
-                chunk = await stream.read(65536)
-                if not chunk:
-                    break
-                target.extend(chunk)
-                if len(target) > self.capture_limit_bytes:
-                    del target[: len(target) - self.capture_limit_bytes]
-                await write_log(chunk)
-
         for command in commands:
             started = time.monotonic()
             await write_log(f"\n$ {command}\n".encode())
-            env = os.environ.copy()
+            command_argv = ["bash", "-lc", command]
+            if self.sandbox is not None:
+                command_argv = self.sandbox.wrap(
+                    command_argv,
+                    cwd,
+                    execution_profile="gate",
+                )
+                env = self.sandbox.environment()
+            else:
+                env = os.environ.copy()
             env.setdefault("CI", "1")
             proc = await asyncio.create_subprocess_exec(
-                "bash",
-                "-lc",
-                command,
+                *command_argv,
                 cwd=str(cwd),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -120,9 +123,27 @@ class GateRunner:
             )
             stdout_b = bytearray()
             stderr_b = bytearray()
+
+            async def pump(stream: asyncio.StreamReader | None, target: bytearray) -> None:
+                if stream is None:
+                    return
+                try:
+                    while True:
+                        chunk = await stream.read(65536)
+                        if not chunk:
+                            break
+                        target.extend(chunk)
+                        if len(target) > self.capture_limit_bytes:
+                            del target[: len(target) - self.capture_limit_bytes]
+                        await write_log(chunk)
+                except (OSError, YoloError):
+                    await self._terminate_group(proc)
+                    raise
+
             stdout_task = asyncio.create_task(pump(proc.stdout, stdout_b))
             stderr_task = asyncio.create_task(pump(proc.stderr, stderr_b))
             timed_out = False
+            pump_results: list[object] = []
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
             except TimeoutError:
@@ -132,7 +153,13 @@ class GateRunner:
                 await self._terminate_group(proc)
                 raise
             finally:
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                pump_results = list(
+                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                )
+
+            for pump_result in pump_results:
+                if isinstance(pump_result, BaseException):
+                    raise pump_result
 
             result = GateResult(
                 command=command,
