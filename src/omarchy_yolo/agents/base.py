@@ -51,10 +51,17 @@ class CommandAgent:
     def available(self) -> bool:
         return bool(self.config.enabled and self.config.command and shutil.which(self.config.command[0]))
 
+    def _trusted_builtin_review_identity(self) -> bool:
+        if self.name not in _BUILTIN_REVIEW_AGENTS or not self.config.command:
+            return False
+        return Path(self.config.command[0]).name == self.name
+
     def supports_profile(self, execution_profile: str) -> bool:
         if execution_profile != "review":
             return True
-        return bool(self.config.review_command or self.name in _BUILTIN_REVIEW_AGENTS)
+        if self.config.review_command:
+            return bool(shutil.which(self.config.review_command[0]))
+        return self._trusted_builtin_review_identity()
 
     @staticmethod
     def _strip_option_with_value(argv: list[str], option: str) -> list[str]:
@@ -78,6 +85,11 @@ class CommandAgent:
         if execution_profile == "review":
             if self.config.review_command:
                 return list(self.config.review_command)
+            if not self._trusted_builtin_review_identity():
+                raise YoloError(
+                    f"agent '{self.name}' has no declared read-only review capability; "
+                    "configure agents.<name>.review_command"
+                )
             if self.name == "codex":
                 argv = [
                     token
