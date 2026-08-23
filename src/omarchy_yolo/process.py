@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from .model import AgentResult
+from .resources import ResourcePolicy
 from .util import (
     YoloError,
     ensure_private_dir,
@@ -72,9 +73,11 @@ class ProcessRunner:
         *,
         capture_limit_bytes: int = 2_000_000,
         log_limit_bytes: int = 64_000_000,
+        resource_policy: ResourcePolicy | None = None,
     ):
         self.capture_limit_bytes = max(1, capture_limit_bytes)
         self.log_limit_bytes = max(1, log_limit_bytes)
+        self.resource_policy = resource_policy or ResourcePolicy()
 
     async def run(
         self,
@@ -98,6 +101,7 @@ class ProcessRunner:
         command = [*argv]
         if prompt_arg is not None:
             command.append(prompt_arg)
+        command = self.resource_policy.wrap(command)
         started = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -130,18 +134,14 @@ class ProcessRunner:
                             if not chunk.endswith(b"\n"):
                                 payload += b"\n"
                             remaining = self.log_limit_bytes - logged_bytes
-                            payload_budget = max(
-                                0, remaining - len(_LOG_TRUNCATION_MARKER)
-                            )
+                            payload_budget = max(0, remaining - len(_LOG_TRUNCATION_MARKER))
                             truncated_now = len(payload) > payload_budget
                             payload = payload[:payload_budget]
                             with open_private_binary(log_path, append=True) as fh:
                                 fh.write(payload)
                             logged_bytes += len(payload)
                             if truncated_now and not log_truncated:
-                                marker = _LOG_TRUNCATION_MARKER[
-                                    : self.log_limit_bytes - logged_bytes
-                                ]
+                                marker = _LOG_TRUNCATION_MARKER[: self.log_limit_bytes - logged_bytes]
                                 with open_private_binary(log_path, append=True) as fh:
                                     fh.write(marker)
                                 logged_bytes += len(marker)

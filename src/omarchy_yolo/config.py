@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .resources import ResourcePolicy
 from .util import YoloError, xdg_config_home, xdg_state_home
 
 
@@ -88,6 +89,7 @@ class Config:
     git: GitConfig = field(default_factory=GitConfig)
     gates: GateConfig = field(default_factory=GateConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    resources: ResourcePolicy = field(default_factory=ResourcePolicy)
     agents: dict[str, AgentConfig] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -239,13 +241,7 @@ def load_config(path: Path | None = None) -> Config:
         raise YoloError("engine.execution_profile must be 'yolo-worktree' or 'danger-yolo'")
     engine = EngineConfig(
         max_parallel=_bounded_int(e.get("max_parallel", 4), default=4, minimum=1, maximum=64, name="engine.max_parallel"),
-        max_global_workers=_bounded_int(
-            e.get("max_global_workers", 4),
-            default=4,
-            minimum=1,
-            maximum=128,
-            name="engine.max_global_workers",
-        ),
+        max_global_workers=_bounded_int(e.get("max_global_workers", 4), default=4, minimum=1, maximum=128, name="engine.max_global_workers"),
         max_attempts=_bounded_int(e.get("max_attempts", 3), default=3, minimum=1, maximum=20, name="engine.max_attempts"),
         max_final_cycles=_bounded_int(e.get("max_final_cycles", 2), default=2, minimum=0, maximum=20, name="engine.max_final_cycles"),
         max_tasks=_bounded_int(e.get("max_tasks", 12), default=12, minimum=1, maximum=256, name="engine.max_tasks"),
@@ -254,51 +250,21 @@ def load_config(path: Path | None = None) -> Config:
         planner_agent=_agent_name(e.get("planner_agent", "codex"), field_name="engine.planner_agent"),
         reviewer_agent=_agent_name(e.get("reviewer_agent", "claude"), field_name="engine.reviewer_agent"),
         integrator_agent=_agent_name(e.get("integrator_agent", "codex"), field_name="engine.integrator_agent"),
-        worker_agents=_agent_names(
-            e.get("worker_agents"),
-            default=("codex", "claude", "opencode"),
-            field_name="engine.worker_agents",
-        ),
+        worker_agents=_agent_names(e.get("worker_agents"), default=("codex", "claude", "opencode"), field_name="engine.worker_agents"),
         auto_apply=_strict_bool(e.get("auto_apply"), default=False, name="engine.auto_apply"),
         cleanup_worktrees=_strict_bool(e.get("cleanup_worktrees"), default=True, name="engine.cleanup_worktrees"),
         execution_profile=execution_profile,
-        final_review_chunk_bytes=_bounded_int(
-            e.get("final_review_chunk_bytes", 60_000),
-            default=60_000,
-            minimum=8_000,
-            maximum=120_000,
-            name="engine.final_review_chunk_bytes",
-        ),
-        final_review_chunk_files=_bounded_int(
-            e.get("final_review_chunk_files", 8),
-            default=8,
-            minimum=1,
-            maximum=64,
-            name="engine.final_review_chunk_files",
-        ),
-        final_review_max_files=_bounded_int(
-            e.get("final_review_max_files", 512),
-            default=512,
-            minimum=1,
-            maximum=4096,
-            name="engine.final_review_max_files",
-        ),
-        final_review_allow_binary=_strict_bool(
-            e.get("final_review_allow_binary"),
-            default=False,
-            name="engine.final_review_allow_binary",
-        ),
+        final_review_chunk_bytes=_bounded_int(e.get("final_review_chunk_bytes", 60_000), default=60_000, minimum=8_000, maximum=120_000, name="engine.final_review_chunk_bytes"),
+        final_review_chunk_files=_bounded_int(e.get("final_review_chunk_files", 8), default=8, minimum=1, maximum=64, name="engine.final_review_chunk_files"),
+        final_review_max_files=_bounded_int(e.get("final_review_max_files", 512), default=512, minimum=1, maximum=4096, name="engine.final_review_max_files"),
+        final_review_allow_binary=_strict_bool(e.get("final_review_allow_binary"), default=False, name="engine.final_review_allow_binary"),
     )
 
     s = _section(data, "sandbox")
     backend = str(s.get("backend", "native"))
     if backend not in {"native", "none", "bwrap"}:
         raise YoloError("sandbox.backend must be 'native', 'none', or 'bwrap'")
-    hostile_repo_mode = _strict_bool(
-        s.get("hostile_repo_mode"),
-        default=False,
-        name="sandbox.hostile_repo_mode",
-    )
+    hostile_repo_mode = _strict_bool(s.get("hostile_repo_mode"), default=False, name="sandbox.hostile_repo_mode")
     if hostile_repo_mode and backend != "bwrap":
         raise YoloError("sandbox.hostile_repo_mode requires sandbox.backend='bwrap'")
     sandbox = SandboxConfig(
@@ -307,44 +273,20 @@ def load_config(path: Path | None = None) -> Config:
         read_only_home=_strict_bool(s.get("read_only_home"), default=False, name="sandbox.read_only_home"),
         writable_home_paths=_writable_home_paths(s.get("writable_home_paths")),
         hostile_repo_mode=hostile_repo_mode,
-        gate_env_allowlist=_environment_names(
-            s.get("gate_env_allowlist"), field_name="sandbox.gate_env_allowlist"
-        ),
-        agent_env_allowlist=_environment_names(
-            s.get("agent_env_allowlist"), field_name="sandbox.agent_env_allowlist"
-        ),
+        gate_env_allowlist=_environment_names(s.get("gate_env_allowlist"), field_name="sandbox.gate_env_allowlist"),
+        agent_env_allowlist=_environment_names(s.get("agent_env_allowlist"), field_name="sandbox.agent_env_allowlist"),
     )
 
     g = _section(data, "git")
-    allow_repository_commands = _strict_bool(
-        g.get("allow_repository_commands"),
-        default=not hostile_repo_mode,
-        name="git.allow_repository_commands",
-    )
+    allow_repository_commands = _strict_bool(g.get("allow_repository_commands"), default=not hostile_repo_mode, name="git.allow_repository_commands")
     if hostile_repo_mode and allow_repository_commands:
-        raise YoloError(
-            "sandbox.hostile_repo_mode requires git.allow_repository_commands=false"
-        )
+        raise YoloError("sandbox.hostile_repo_mode requires git.allow_repository_commands=false")
     git = GitConfig(
         require_clean_repo=_strict_bool(g.get("require_clean_repo"), default=True, name="git.require_clean_repo"),
         branch_prefix=_branch_prefix(g.get("branch_prefix", "yolo")),
-        commit_name=_identity_value(
-            g.get("commit_name", "Omarchy YOLO"),
-            field_name="git.commit_name",
-            maximum=200,
-        ),
-        commit_email=_identity_value(
-            g.get("commit_email", "omarchy-yolo@localhost"),
-            field_name="git.commit_email",
-            maximum=320,
-        ),
-        command_timeout_seconds=_bounded_int(
-            g.get("command_timeout_seconds", 120),
-            default=120,
-            minimum=5,
-            maximum=900,
-            name="git.command_timeout_seconds",
-        ),
+        commit_name=_identity_value(g.get("commit_name", "Omarchy YOLO"), field_name="git.commit_name", maximum=200),
+        commit_email=_identity_value(g.get("commit_email", "omarchy-yolo@localhost"), field_name="git.commit_email", maximum=320),
+        command_timeout_seconds=_bounded_int(g.get("command_timeout_seconds", 120), default=120, minimum=5, maximum=900, name="git.command_timeout_seconds"),
         allow_repository_commands=allow_repository_commands,
     )
 
@@ -352,6 +294,23 @@ def load_config(path: Path | None = None) -> Config:
     gates = GateConfig(
         commands=_tuple_str(gates_section.get("commands")),
         final_commands=_tuple_str(gates_section.get("final_commands")),
+    )
+
+    r = _section(data, "resources")
+    resource_backend = str(r.get("backend", "none"))
+    if resource_backend not in {"none", "systemd"}:
+        raise YoloError("resources.backend must be 'none' or 'systemd'")
+    memory_high_mib = _bounded_int(r.get("memory_high_mib", 0), default=0, minimum=0, maximum=1_048_576, name="resources.memory_high_mib")
+    memory_max_mib = _bounded_int(r.get("memory_max_mib", 0), default=0, minimum=0, maximum=1_048_576, name="resources.memory_max_mib")
+    if memory_high_mib and memory_max_mib and memory_high_mib > memory_max_mib:
+        raise YoloError("resources.memory_high_mib cannot exceed resources.memory_max_mib")
+    resources = ResourcePolicy(
+        backend=resource_backend,
+        memory_max_mib=memory_max_mib,
+        memory_high_mib=memory_high_mib,
+        tasks_max=_bounded_int(r.get("tasks_max", 0), default=0, minimum=0, maximum=1_000_000, name="resources.tasks_max"),
+        cpu_quota_percent=_bounded_int(r.get("cpu_quota_percent", 0), default=0, minimum=0, maximum=10_000, name="resources.cpu_quota_percent"),
+        io_weight=_bounded_int(r.get("io_weight", 0), default=0, minimum=0, maximum=10_000, name="resources.io_weight"),
     )
 
     agents_section = _section(data, "agents")
@@ -371,9 +330,7 @@ def load_config(path: Path | None = None) -> Config:
         if safe_name in agents or not isinstance(raw, dict):
             continue
         agents[safe_name] = AgentConfig(
-            enabled=_strict_bool(
-                raw.get("enabled"), default=True, name=f"agents.{safe_name}.enabled"
-            ),
+            enabled=_strict_bool(raw.get("enabled"), default=True, name=f"agents.{safe_name}.enabled"),
             command=_tuple_str(raw.get("command")),
             review_command=_tuple_str(raw.get("review_command")),
             roles=_agent_roles(raw.get("roles"), field_name=f"agents.{safe_name}.roles"),
@@ -386,5 +343,6 @@ def load_config(path: Path | None = None) -> Config:
         git=git,
         gates=gates,
         sandbox=sandbox,
+        resources=resources,
         agents=agents,
     )

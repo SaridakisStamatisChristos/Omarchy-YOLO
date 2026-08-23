@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0 - 2026-08-23
+
+- Add an executable orchestration state reference model covering every job/task/attempt transition plus cross-record terminal-state invariants; ordinary durable state mutations fail closed on illegal transitions while transactional recovery keeps its explicit modeled recovery paths.
+- Introduce SQLite schema version 2 using `PRAGMA user_version`, transactional forward migrations, fail-closed future-schema detection, automatic private pre-migration backups, and post-migration integrity verification.
+- Add deterministic, SHA-256-addressed execution dossiers containing accepted Git commits, effective policy/config fingerprints, agent capability contracts, task/attempt history and a hashed durable-event prefix; persist the dossier before a job is durably completed.
+- Add the offline `yolo-dossier` verifier/exporter so provenance can be independently checked from SQLite even when the daemon is not running.
+- Add optional systemd/cgroups-v2 resource sovereignty for all agent and gate process trees with configurable `MemoryHigh`, `MemoryMax`, `TasksMax`, `CPUQuota` and `IOWeight`; the default remains `backend = "none"` for compatibility.
+- Preserve v1.3 Bubblewrap/hostile-repository isolation while composing cgroup scopes outside the sandbox so resource limits govern the complete child process tree.
+- Expand state-machine, migration, provenance, resource-policy and orchestration-path regression coverage; legacy tests now seed states through legal lifecycle transitions rather than bypassing the production contract.
+- Keep package runtime, wheel metadata, installer output and Quickshell manifest synchronized at `1.4.0`, and verify the `yolo-dossier` entry point from the clean installed wheel.
+
 ## 1.3.0 - 2026-08-23
 
 - Make every control-plane Git subprocess finite and output-bounded, terminate descendant process groups even after a command leader exits, disable ambient Git redirection/config, and use the configured release identity for unsigned integration commits; apply the same surviving-descendant cleanup to agent and gate timeouts.

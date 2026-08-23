@@ -13,6 +13,7 @@ from .omarchy import notify
 from .orchestrator_integration import IntegrationMixin
 from .orchestrator_task import TaskExecutionMixin
 from .planner import Planner
+from .provenance import DOSSIER_SCHEMA_VERSION, build_dossier
 from .reviewer import Reviewer
 from .runtime import ResourceCoordinator
 from .sandbox import Sandbox
@@ -36,7 +37,10 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         self.config = config
         self.db = db
         self.registry = registry or AgentRegistry(config)
-        self.gates = gate_runner or GateRunner(sandbox=Sandbox(config.sandbox))
+        self.gates = gate_runner or GateRunner(
+            sandbox=Sandbox(config.sandbox),
+            resource_policy=config.resources,
+        )
         self.planner = Planner(self.registry, max_tasks=config.engine.max_tasks)
         self.reviewer = Reviewer(self.registry)
         self.coordinator = coordinator or ResourceCoordinator(config.engine.max_global_workers)
@@ -88,9 +92,9 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             async with self.coordinator.worker_slot():
                 final_summary = await self._finalize(job_id, repo, integration_path)
             job = self.db.get_job(job_id)
-            # Final review is the acceptance boundary. If cancellation arrives while
-            # optional source application is in flight, finish application/refusal and
-            # persist completion together so an applied source can never be re-queued.
+            # Final review is the acceptance boundary. Every fallible provenance
+            # operation completes before optional source application. The protected
+            # step then finishes application/refusal and durable completion together.
             await finish_before_cancel(
                 self._complete_accepted_job(job, repo, final_summary)
             )
@@ -152,6 +156,30 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         final_summary: str,
     ) -> None:
         accepted = self.db.get_job(job.id)
+        final_commit = await asyncio.to_thread(repo.head, Path(accepted.integration_path))
+        dossier_content, dossier_sha256 = await asyncio.to_thread(
+            build_dossier,
+            db=self.db,
+            config=self.config,
+            registry=self.registry,
+            job_id=accepted.id,
+            final_commit=final_commit,
+            final_summary=final_summary,
+            source_apply_intent="requested" if accepted.auto_apply else "not-requested",
+        )
+        self.db.store_dossier(
+            accepted.id,
+            schema_version=DOSSIER_SCHEMA_VERSION,
+            sha256=dossier_sha256,
+            content=dossier_content,
+        )
+        self.db.event(
+            accepted.id,
+            "job.dossier_created",
+            {"sha256": dossier_sha256, "schema_version": DOSSIER_SCHEMA_VERSION},
+        )
+
+        source_apply_outcome = "not-requested"
         if accepted.auto_apply:
             try:
                 async with self.coordinator.repo_lock(repo.root):
@@ -161,8 +189,10 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                         accepted.base_branch,
                         accepted.base_commit,
                     )
+                source_apply_outcome = "applied"
                 self.db.event(accepted.id, "job.applied", {"branch": accepted.base_branch})
             except GitError as exc:
+                source_apply_outcome = f"skipped: {str(exc)[-1_000:]}"
                 self.db.event(accepted.id, "job.apply_skipped", {"reason": str(exc)})
 
         self.db.update_job(
@@ -175,7 +205,12 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         self.db.event(
             accepted.id,
             "job.completed",
-            {"summary": final_summary, "branch": accepted.integration_branch},
+            {
+                "summary": final_summary,
+                "branch": accepted.integration_branch,
+                "dossier_sha256": dossier_sha256,
+                "source_apply_outcome": source_apply_outcome,
+            },
         )
         notify(
             "YOLO completed",

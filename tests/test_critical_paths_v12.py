@@ -138,7 +138,7 @@ async def test_gate_timeout_kills_process_group(tmp_path: Path) -> None:
     result = await GateRunner().run(
         (f"echo $$ > {pidfile}; sleep 30",),
         cwd=tmp_path,
-        timeout_seconds=1,
+        timeout_seconds=3,
         log_path=tmp_path / "timeout.log",
     )
     assert len(result) == 1

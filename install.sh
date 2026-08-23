@@ -47,6 +47,14 @@ WRAPPER
 chmod 755 "$BIN_DIR/yolo"
 ln -sfn "$BIN_DIR/yolo" "$BIN_DIR/omarchy-yolo"
 
+cat > "$BIN_DIR/yolo-dossier" <<'WRAPPER'
+#!/bin/bash
+set -euo pipefail
+export PYTHONPATH="$HOME/.local/share/omarchy-yolo/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m omarchy_yolo.dossier_cli "$@"
+WRAPPER
+chmod 755 "$BIN_DIR/yolo-dossier"
+
 cp "$ROOT/systemd/omarchy-yolo.service" "$SERVICE_DIR/omarchy-yolo.service"
 
 rm -rf "$PLUGIN_DIR"

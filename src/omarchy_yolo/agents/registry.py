@@ -4,6 +4,7 @@ from collections.abc import Iterable
 
 from ..config import Config
 from ..model import AgentRole
+from ..process import ProcessRunner
 from ..util import YoloError
 from .base import AgentLike, CommandAgent
 
@@ -12,7 +13,13 @@ class AgentRegistry:
     def __init__(self, config: Config, overrides: dict[str, AgentLike] | None = None):
         self.config = config
         self._agents: dict[str, AgentLike] = {
-            name: CommandAgent(name, agent_cfg, config) for name, agent_cfg in config.agents.items()
+            name: CommandAgent(
+                name,
+                agent_cfg,
+                config,
+                runner=ProcessRunner(resource_policy=config.resources),
+            )
+            for name, agent_cfg in config.agents.items()
         }
         if overrides:
             self._agents.update(overrides)

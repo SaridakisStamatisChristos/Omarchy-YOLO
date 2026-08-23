@@ -45,6 +45,7 @@ async def test_completed_job_cannot_be_stopped(
 ) -> None:
     daemon = make_daemon(tmp_path, monkeypatch)
     job = make_job(daemon)
+    daemon.db.update_job(job.id, state=JobState.RUNNING)
     daemon.db.update_job(job.id, state=JobState.COMPLETED)
     with pytest.raises(YoloError, match="immutable"):
         await daemon.dispatch("stop", {"job_id": job.id})

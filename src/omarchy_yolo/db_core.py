@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -11,13 +12,18 @@ from .model import JobRecord, JobState, TaskRecord, TaskState
 from .util import YoloError, ensure_private_dir
 
 
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-PRAGMA synchronous=NORMAL;
-PRAGMA busy_timeout=5000;
-PRAGMA trusted_schema=OFF;
+CURRENT_SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 
+_PRAGMAS = (
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA foreign_keys=ON",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA busy_timeout=5000",
+    "PRAGMA trusted_schema=OFF",
+)
+
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   repo TEXT NOT NULL,
@@ -83,11 +89,33 @@ CREATE TABLE IF NOT EXISTS events (
   created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dossiers (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  schema_version INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_job_state ON tasks(job_id, state);
 CREATE INDEX IF NOT EXISTS idx_attempts_job_task ON attempts(job_id, task_id, number DESC);
 CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
+
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: (
+        """
+        CREATE TABLE IF NOT EXISTS dossiers (
+          job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+          schema_version INTEGER NOT NULL,
+          sha256 TEXT NOT NULL,
+          content TEXT NOT NULL,
+          created_at REAL NOT NULL
+        )
+        """,
+    ),
+}
 
 MAX_JOB_LIST_LIMIT = 200
 MAX_EVENT_LIST_LIMIT = 100
@@ -100,7 +128,9 @@ class DatabaseCore:
         self.path = path
         if path.is_symlink():
             raise YoloError(f"refusing symlink for database path: {path}")
+        existed = path.exists()
         self._lock = threading.RLock()
+        self.last_migration_backup: Path | None = None
         try:
             self._conn = sqlite3.connect(
                 path,
@@ -110,7 +140,25 @@ class DatabaseCore:
             self._conn.row_factory = sqlite3.Row
             os.chmod(path, 0o600)
             with self._lock:
-                self._conn.executescript(SCHEMA)
+                for pragma in _PRAGMAS:
+                    self._conn.execute(pragma)
+                has_schema = self._has_table("jobs")
+                if not existed or not has_schema:
+                    self._conn.executescript(SCHEMA)
+                    self._set_schema_version(CURRENT_SCHEMA_VERSION)
+                else:
+                    version = self._schema_version()
+                    if version == 0:
+                        version = LEGACY_SCHEMA_VERSION
+                    if version > CURRENT_SCHEMA_VERSION:
+                        raise sqlite3.DatabaseError(
+                            f"database schema v{version} is newer than supported v{CURRENT_SCHEMA_VERSION}"
+                        )
+                    if version < CURRENT_SCHEMA_VERSION:
+                        self.last_migration_backup = self._backup_before_migration(version)
+                        self._migrate(version)
+                    self._conn.executescript(SCHEMA)
+                    self._set_schema_version(CURRENT_SCHEMA_VERSION)
                 check = self._conn.execute("PRAGMA quick_check").fetchone()
                 if check is None or str(check[0]).lower() != "ok":
                     detail = str(check[0]) if check is not None else "no result"
@@ -119,7 +167,65 @@ class DatabaseCore:
             connection = getattr(self, "_conn", None)
             if connection is not None:
                 connection.close()
-            raise YoloError(f"database initialization/integrity check failed: {exc}") from exc
+            backup = (
+                f"; pre-migration backup: {self.last_migration_backup}"
+                if self.last_migration_backup is not None
+                else ""
+            )
+            raise YoloError(
+                f"database initialization/integrity check failed: {exc}{backup}"
+            ) from exc
+
+    def _has_table(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def _schema_version(self) -> int:
+        row = self._conn.execute("PRAGMA user_version").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def schema_version(self) -> int:
+        with self._lock:
+            return self._schema_version()
+
+    def _set_schema_version(self, version: int) -> None:
+        self._conn.execute(f"PRAGMA user_version = {int(version)}")
+
+    def _backup_before_migration(self, version: int) -> Path:
+        backup_path = self.path.with_name(
+            f"{self.path.name}.pre-v{version}-to-v{CURRENT_SCHEMA_VERSION}-{time.time_ns()}.bak"
+        )
+        if backup_path.exists() or backup_path.is_symlink():
+            raise sqlite3.DatabaseError(f"refusing existing migration backup path: {backup_path}")
+        backup = sqlite3.connect(backup_path)
+        try:
+            self._conn.backup(backup)
+        finally:
+            backup.close()
+        os.chmod(backup_path, 0o600)
+        return backup_path
+
+    def _migrate(self, version: int) -> None:
+        current = version
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            while current < CURRENT_SCHEMA_VERSION:
+                statements = _MIGRATIONS.get(current)
+                if statements is None:
+                    raise sqlite3.DatabaseError(
+                        f"no migration path from schema v{current} to v{current + 1}"
+                    )
+                for statement in statements:
+                    self._conn.execute(statement)
+                current += 1
+                self._set_schema_version(current)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         with self._lock:

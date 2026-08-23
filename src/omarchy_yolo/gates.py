@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .model import GateResult
 from .process import _drain_process_pumps, _terminate_process_group
+from .resources import ResourcePolicy
 from .sandbox import Sandbox
 from .util import (
     YoloError,
@@ -72,10 +73,12 @@ class GateRunner:
         capture_limit_bytes: int = CAPTURE_LIMIT_BYTES,
         log_limit_bytes: int = LOG_LIMIT_BYTES,
         sandbox: Sandbox | None = None,
+        resource_policy: ResourcePolicy | None = None,
     ):
         self.capture_limit_bytes = max(1, capture_limit_bytes)
         self.log_limit_bytes = max(1, log_limit_bytes)
         self.sandbox = sandbox
+        self.resource_policy = resource_policy or ResourcePolicy()
 
     async def run(
         self,
@@ -105,9 +108,7 @@ class GateRunner:
                         fh.write(payload)
                     logged_bytes += len(payload)
                     if truncated_now and not log_truncated:
-                        marker = _LOG_TRUNCATION_MARKER[
-                            : self.log_limit_bytes - logged_bytes
-                        ]
+                        marker = _LOG_TRUNCATION_MARKER[: self.log_limit_bytes - logged_bytes]
                         with open_private_binary(log_path, append=True) as fh:
                             fh.write(marker)
                         logged_bytes += len(marker)
@@ -148,6 +149,7 @@ class GateRunner:
                 env = self.sandbox.environment("gate")
             else:
                 env = os.environ.copy()
+            command_argv = self.resource_policy.wrap(command_argv)
             env.setdefault("CI", "1")
             proc = await asyncio.create_subprocess_exec(
                 *command_argv,

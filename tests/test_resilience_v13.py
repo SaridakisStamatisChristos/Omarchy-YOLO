@@ -352,6 +352,8 @@ async def test_cancelled_integration_transaction_rolls_back_before_unlock(
         worktree=str(worker),
         base_commit=base,
     )
+    db.update_task(task.id, state=TaskState.RUNNING)
+    db.update_task(task.id, state=TaskState.REVIEWING)
     orchestrator = Orchestrator(config, db)
     merge_visible = asyncio.Event()
     wait_forever = asyncio.Event()
@@ -449,6 +451,9 @@ async def test_cancelled_post_release_cleanup_preserves_completed_job(
         auto_apply=False,
     )
     task = db.add_tasks(job.id, [PlannedTask("T1", "Done", "Already done")])[0]
+    db.update_task(task.id, state=TaskState.RUNNING)
+    db.update_task(task.id, state=TaskState.REVIEWING)
+    db.update_task(task.id, state=TaskState.INTEGRATING)
     db.update_task(task.id, state=TaskState.COMPLETED, result_summary="accepted")
     orchestrator = Orchestrator(config, db)
     cleanup_started = asyncio.Event()
@@ -508,7 +513,14 @@ def test_recovery_state_matrix_closes_attempts_without_regressing_completed_task
             )
             task_state = active_states[index % len(active_states)]
             db.update_job(job.id, state=job_state, stop_requested=stop_requested)
-            db.update_task(inflight.id, state=task_state, attempts=1)
+            db.update_task(inflight.id, state=TaskState.RUNNING, attempts=1)
+            if task_state in {TaskState.REVIEWING, TaskState.INTEGRATING}:
+                db.update_task(inflight.id, state=TaskState.REVIEWING)
+            if task_state == TaskState.INTEGRATING:
+                db.update_task(inflight.id, state=TaskState.INTEGRATING)
+            db.update_task(completed.id, state=TaskState.RUNNING)
+            db.update_task(completed.id, state=TaskState.REVIEWING)
+            db.update_task(completed.id, state=TaskState.INTEGRATING)
             db.update_task(completed.id, state=TaskState.COMPLETED)
             db.start_attempt(
                 job_id=job.id,
@@ -611,6 +623,9 @@ async def test_cancelled_auto_apply_cannot_leave_applied_source_requeued(
         auto_apply=True,
     )
     task = db.add_tasks(job.id, [PlannedTask("T1", "Done", "Already done")])[0]
+    db.update_task(task.id, state=TaskState.RUNNING)
+    db.update_task(task.id, state=TaskState.REVIEWING)
+    db.update_task(task.id, state=TaskState.INTEGRATING)
     db.update_task(task.id, state=TaskState.COMPLETED, result_summary="accepted")
     orchestrator = Orchestrator(config, db)
     source_applied = threading.Event()
@@ -1365,7 +1380,7 @@ def test_v13_release_surfaces_and_quickshell_telemetry_are_synchronized() -> Non
     panel = (root / "shell-plugin/Panel.qml").read_text()
     service = (root / "systemd/omarchy-yolo.service").read_text()
 
-    assert __version__ == project["project"]["version"] == manifest["version"] == "1.3.0"
+    assert __version__ == project["project"]["version"] == manifest["version"] == "1.4.0"
     assert 'echo "Installed Omarchy YOLO $VERSION"' in install
     assert project["tool"]["coverage"]["report"]["fail_under"] == 76
     for field in (

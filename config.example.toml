@@ -70,6 +70,21 @@ gate_env_allowlist = []
 # only variables an agent CLI must receive (for example one provider token).
 agent_env_allowlist = []
 
+[resources]
+# Optional cgroups-v2 resource envelope for every agent and gate process tree.
+# "none" preserves the v1.3 behavior. "systemd" uses a transient --user scope
+# via systemd-run, which is native to Omarchy's systemd user session.
+backend = "none"
+# 0 disables an individual limit. When both memory values are set, high <= max.
+memory_high_mib = 0
+memory_max_mib = 0
+# Hard process/thread count for each child scope. Useful against fork bombs.
+tasks_max = 0
+# 100 = one full CPU, 300 = three CPUs worth of quota. 0 disables the quota.
+cpu_quota_percent = 0
+# cgroups-v2 I/O weight, 1..10000 when enabled. 0 leaves the default unchanged.
+io_weight = 0
+
 [agents.codex]
 enabled = true
 command = ["codex", "exec", "--full-auto", "--sandbox", "workspace-write"]
