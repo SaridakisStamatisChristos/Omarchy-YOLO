@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
 
+from . import __version__
 from .agents import AgentRegistry
 from .config import Config, load_config
 from .db import MAX_EVENT_LIST_LIMIT, MAX_JOB_LIST_LIMIT, Database
@@ -195,7 +196,7 @@ class YoloDaemon:
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
-            return {"version": "1.1.0", "pid": os.getpid()}
+            return {"version": __version__, "pid": os.getpid()}
         if method == "runtime":
             return self.coordinator.snapshot()
         if method == "submit":
