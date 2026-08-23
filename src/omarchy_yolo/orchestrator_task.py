@@ -55,6 +55,9 @@ class TaskExecutionMixin:
         retry_context = task.last_error
 
         stored_worktree = Path(task.worktree) if task.worktree else None
+        branch_exists = False
+        if task.branch:
+            branch_exists = await asyncio.to_thread(repo.branch_exists, task.branch)
         if (
             stored_worktree is not None
             and task.branch
@@ -64,7 +67,7 @@ class TaskExecutionMixin:
             worktree = stored_worktree
             branch = task.branch
             base_commit = task.base_commit
-        elif task.branch and await asyncio.to_thread(repo.branch_exists, task.branch):
+        elif task.branch and branch_exists:
             # Recovery path: keep durable commits on the task branch even if the worktree directory
             # vanished or its registration went stale. Reattaching is safer than recreating the
             # branch from integration and silently discarding progress.
@@ -87,9 +90,7 @@ class TaskExecutionMixin:
         else:
             async with self._merge_lock:
                 base_commit = await asyncio.to_thread(repo.head, integration_path)
-                branch = (
-                    f"{self.config.git.branch_prefix}/{job_id}/{slug(task.logical_id)}"
-                )
+                branch = f"{self.config.git.branch_prefix}/{job_id}/{slug(task.logical_id)}"
                 worktree = self.config.worktrees_dir / job_id / f"task-{task.seq}-{slug(task.logical_id)}"
                 await asyncio.to_thread(repo.ensure_worktree, worktree, branch, base_commit)
             self.db.update_task(
@@ -313,4 +314,3 @@ class TaskExecutionMixin:
             except Exception as exc:
                 errors.append(f"{candidate}: {exc}")
         return ReviewResult("retry", "review infrastructure failed", tuple(errors))
-
