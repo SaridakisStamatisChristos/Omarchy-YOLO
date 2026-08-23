@@ -110,7 +110,17 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             notify("YOLO completed", f"{Path(job.repo).name}: {job.integration_branch}")
 
             if self.config.engine.cleanup_worktrees:
-                await self._cleanup_completed(repo, job_id, integration_path)
+                try:
+                    await self._cleanup_completed(repo, job_id, integration_path)
+                except Exception as exc:
+                    # Cleanup is post-release housekeeping. Once the candidate has passed all
+                    # gates/review and the job is durably completed, a stale worktree must not
+                    # rewrite that completed result to FAILED.
+                    self.db.event(
+                        job_id,
+                        "job.cleanup_failed",
+                        {"error": str(exc)[-4_000:]},
+                    )
         except asyncio.CancelledError:
             await self._cancel_active()
             current = self.db.get_job(job_id)
