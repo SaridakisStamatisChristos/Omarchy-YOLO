@@ -17,6 +17,7 @@ from .git import GitRepo
 from .model import JobRecord, JobState, TaskState
 from .orchestrator import Orchestrator
 from .rpc import MAX_RPC_MESSAGE_BYTES
+from .runtime import ResourceCoordinator
 from .util import YoloError, current_uid, ensure_private_dir, new_id, xdg_runtime_dir
 
 MAX_GOAL_CHARS = 16_000
@@ -33,6 +34,7 @@ class YoloDaemon:
         ensure_private_dir(config.logs_dir)
         self.db = Database(config.db_path)
         self.registry = AgentRegistry(config)
+        self.coordinator = ResourceCoordinator(config.engine.max_global_workers)
         self.runners: dict[str, asyncio.Task[None]] = {}
         runtime = ensure_private_dir(xdg_runtime_dir())
         self.socket_path = runtime / "omarchy-yolo.sock"
@@ -113,7 +115,12 @@ class YoloDaemon:
         current = self.runners.get(job_id)
         if current is not None and not current.done():
             return
-        orchestrator = Orchestrator(self.config, self.db, registry=self.registry)
+        orchestrator = Orchestrator(
+            self.config,
+            self.db,
+            registry=self.registry,
+            coordinator=self.coordinator,
+        )
         task = asyncio.create_task(orchestrator.run_job(job_id), name=f"job:{job_id}")
         self.runners[job_id] = task
 
@@ -163,7 +170,6 @@ class YoloDaemon:
             writer.write(encoded)
             await writer.drain()
         except (json.JSONDecodeError, TimeoutError, YoloError):
-            # Malformed/oversized envelopes are closed without reflecting attacker-controlled input.
             return
         finally:
             writer.close()
@@ -189,7 +195,9 @@ class YoloDaemon:
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
-            return {"version": "1.0.1", "pid": os.getpid()}
+            return {"version": "1.1.0", "pid": os.getpid()}
+        if method == "runtime":
+            return self.coordinator.snapshot()
         if method == "submit":
             return await self._submit(params)
         if method == "status":
@@ -266,8 +274,13 @@ class YoloDaemon:
         if method == "agents":
             return {
                 "available": self.registry.available(),
+                "review_available": self.registry.available("review"),
                 "configured": {
-                    name: {"enabled": cfg.enabled, "command": list(cfg.command)}
+                    name: {
+                        "enabled": cfg.enabled,
+                        "command": list(cfg.command),
+                        "review_command": list(cfg.review_command),
+                    }
                     for name, cfg in self.config.agents.items()
                 },
             }
@@ -306,9 +319,10 @@ class YoloDaemon:
         if len(repo_value) > MAX_REPO_PATH_CHARS:
             raise YoloError("repository path is too long")
         repo = GitRepo.discover(Path(repo_value).expanduser())
-        base_branch, base_commit = await asyncio.to_thread(
-            repo.preflight, require_clean=self.config.git.require_clean_repo
-        )
+        async with self.coordinator.repo_lock(repo.root):
+            base_branch, base_commit = await asyncio.to_thread(
+                repo.preflight, require_clean=self.config.git.require_clean_repo
+            )
         branch_tag = new_id("run")
         integration_branch = f"{self.config.git.branch_prefix}/{branch_tag}/integration"
         raw_auto_apply = params.get("auto_apply")
@@ -332,8 +346,9 @@ class YoloDaemon:
             job = self.db.get_job(str(job_id))
         else:
             job = self.db.latest_job()
+        runtime = self.coordinator.snapshot()
         if job is None:
-            return {"job": None, "tasks": [], "counts": {}}
+            return {"job": None, "tasks": [], "counts": {}, "runtime": runtime}
         tasks = self.db.list_tasks(job.id)
         counts: dict[str, int] = {}
         for task in tasks:
@@ -366,7 +381,13 @@ class YoloDaemon:
         job_item["goal"] = job.goal[:MAX_GOAL_CHARS]
         job_item["final_summary"] = job.final_summary[-8_000:]
         job_item["error"] = job.error[-8_000:]
-        return {"job": job_item, "tasks": task_items, "counts": counts, "last_events": last_events}
+        return {
+            "job": job_item,
+            "tasks": task_items,
+            "counts": counts,
+            "last_events": last_events,
+            "runtime": runtime,
+        }
 
 
 async def run_daemon(config: Config | None = None) -> None:
