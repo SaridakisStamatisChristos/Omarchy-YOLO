@@ -1,0 +1,22 @@
+[Unit]
+Description=Omarchy YOLO autonomous multi-agent orchestrator
+Documentation=https://github.com/basecamp/omarchy
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yolo daemon
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/omarchy-yolo/env
+
+[Install]
+WantedBy=default.target

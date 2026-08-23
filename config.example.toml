@@ -1,0 +1,49 @@
+[engine]
+max_parallel = 4
+max_attempts = 3
+max_final_cycles = 2
+max_tasks = 12
+agent_timeout_seconds = 3600
+gate_timeout_seconds = 1800
+planner_agent = "codex"
+reviewer_agent = "claude"
+integrator_agent = "codex"
+worker_agents = ["codex", "claude", "opencode"]
+auto_apply = false
+cleanup_worktrees = true
+execution_profile = "yolo-worktree"
+
+[git]
+require_clean_repo = true
+branch_prefix = "yolo"
+commit_name = "Omarchy YOLO"
+commit_email = "omarchy-yolo@localhost"
+
+[gates]
+# Empty means auto-detect from the repository.
+commands = []
+final_commands = []
+
+[sandbox]
+# native: use each agent's own non-interactive/full-auto mode.
+# bwrap: additionally wrap the agent process in bubblewrap.
+# none: no external confinement; still runs as your normal user, never sudo.
+backend = "native"
+network = true
+read_only_home = false
+
+[agents.codex]
+enabled = true
+command = ["codex", "exec", "--full-auto", "--sandbox", "workspace-write"]
+
+[agents.claude]
+enabled = true
+command = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+
+[agents.opencode]
+enabled = true
+command = ["opencode", "run", "--format", "json", "--auto"]
+
+[agents.gemini]
+enabled = false
+command = ["gemini", "-p"]

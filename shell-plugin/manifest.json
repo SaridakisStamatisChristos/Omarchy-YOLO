@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.aether.yolo",
+  "name": "YOLO Agent Control",
+  "version": "1.0.0",
+  "author": "Omarchy YOLO contributors",
+  "description": "Live status and controls for the Omarchy YOLO multi-agent orchestrator",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "YOLO Agent Control",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}
