@@ -1,5 +1,8 @@
 [engine]
+# Per-job parallel task ceiling.
 max_parallel = 4
+# Daemon-wide ceiling shared by every concurrent job.
+max_global_workers = 4
 max_attempts = 3
 max_final_cycles = 2
 max_tasks = 12
@@ -12,6 +15,11 @@ worker_agents = ["codex", "claude", "opencode"]
 auto_apply = false
 cleanup_worktrees = true
 execution_profile = "yolo-worktree"
+# Final release audit is hierarchical and fail-closed: every changed file must fit
+# inside these reviewed limits or the job cannot be marked complete.
+final_review_chunk_bytes = 60000
+final_review_chunk_files = 8
+final_review_max_files = 512
 
 [git]
 require_clean_repo = true
@@ -30,7 +38,11 @@ final_commands = []
 # none: no external confinement; still runs as your normal user, never sudo.
 backend = "native"
 network = true
+# With bwrap, review/planning always sees HOME read-only. Worker mode can also
+# make HOME read-only and selectively re-enable only the credential/session dirs
+# required by a coding CLI.
 read_only_home = false
+writable_home_paths = []
 
 [agents.codex]
 enabled = true
@@ -47,3 +59,12 @@ command = ["opencode", "run", "--format", "json", "--auto"]
 [agents.gemini]
 enabled = false
 command = ["gemini", "-p"]
+# Custom/unsupported reviewer CLIs are never assumed read-only. To make a custom
+# agent eligible for planner/reviewer roles, explicitly declare a non-mutating command:
+# review_command = ["gemini", "-p", "--approval-mode", "plan"]
+
+# Example custom adapter:
+# [agents.local]
+# enabled = true
+# command = ["my-agent", "--write"]
+# review_command = ["my-agent", "--read-only"]
