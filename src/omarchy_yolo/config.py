@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .util import xdg_config_home, xdg_state_home
+from .util import YoloError, xdg_config_home, xdg_state_home
 
 
 @dataclass(slots=True)
@@ -56,15 +57,12 @@ class AgentConfig:
 DEFAULT_AGENT_COMMANDS: dict[str, tuple[str, ...]] = {
     "codex": ("codex", "exec", "--full-auto", "--sandbox", "workspace-write"),
     "claude": ("claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"),
-    "opencode": (
-        "opencode",
-        "run",
-        "--format",
-        "json",
-        "--auto",
-    ),
+    "opencode": ("opencode", "run", "--format", "json", "--auto"),
     "gemini": ("gemini", "-p"),
 }
+
+_BRANCH_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$")
+_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 @dataclass(slots=True)
@@ -101,6 +99,52 @@ def _tuple_str(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
     return tuple(str(x) for x in value)
 
 
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise YoloError(f"{name} must be an integer") from exc
+    if not minimum <= parsed <= maximum:
+        raise YoloError(f"{name} must be between {minimum} and {maximum}")
+    return parsed
+
+
+def _strict_bool(value: Any, *, default: bool, name: str) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise YoloError(f"{name} must be true or false")
+    return value
+
+
+def _agent_name(value: Any, *, field_name: str) -> str:
+    name = str(value).strip()
+    if not _AGENT_NAME_RE.fullmatch(name):
+        raise YoloError(f"{field_name} must be a safe agent identifier")
+    return name
+
+
+def _agent_names(value: Any, *, default: tuple[str, ...], field_name: str) -> tuple[str, ...]:
+    names = _tuple_str(value, default)
+    if not names:
+        raise YoloError(f"{field_name} must contain at least one agent")
+    return tuple(_agent_name(name, field_name=field_name) for name in names)
+
+
+def _branch_prefix(value: Any) -> str:
+    prefix = str(value).strip()
+    invalid = (
+        not _BRANCH_PREFIX_RE.fullmatch(prefix)
+        or ".." in prefix
+        or "//" in prefix
+        or prefix.endswith(("/", ".", ".lock"))
+        or "@{" in prefix
+    )
+    if invalid:
+        raise YoloError("git.branch_prefix is not a safe Git ref prefix")
+    return prefix
+
+
 def load_config(path: Path | None = None) -> Config:
     config_path = path or Path(
         os.environ.get("OMARCHY_YOLO_CONFIG", xdg_config_home() / "omarchy-yolo/config.toml")
@@ -115,28 +159,35 @@ def load_config(path: Path | None = None) -> Config:
     ).expanduser()
 
     e = _section(data, "engine")
+    execution_profile = str(e.get("execution_profile", "yolo-worktree"))
+    if execution_profile not in {"yolo-worktree", "danger-yolo"}:
+        raise YoloError("engine.execution_profile must be 'yolo-worktree' or 'danger-yolo'")
     engine = EngineConfig(
-        max_parallel=max(1, int(e.get("max_parallel", 4))),
-        max_attempts=max(1, int(e.get("max_attempts", 3))),
-        max_final_cycles=max(0, int(e.get("max_final_cycles", 2))),
-        max_tasks=max(1, int(e.get("max_tasks", 12))),
-        agent_timeout_seconds=max(1, int(e.get("agent_timeout_seconds", 3600))),
-        gate_timeout_seconds=max(1, int(e.get("gate_timeout_seconds", 1800))),
-        planner_agent=str(e.get("planner_agent", "codex")),
-        reviewer_agent=str(e.get("reviewer_agent", "claude")),
-        integrator_agent=str(e.get("integrator_agent", "codex")),
-        worker_agents=_tuple_str(e.get("worker_agents"), ("codex", "claude", "opencode")),
-        auto_apply=bool(e.get("auto_apply", False)),
-        cleanup_worktrees=bool(e.get("cleanup_worktrees", True)),
-        execution_profile=str(e.get("execution_profile", "yolo-worktree")),
+        max_parallel=_bounded_int(e.get("max_parallel", 4), default=4, minimum=1, maximum=64, name="engine.max_parallel"),
+        max_attempts=_bounded_int(e.get("max_attempts", 3), default=3, minimum=1, maximum=20, name="engine.max_attempts"),
+        max_final_cycles=_bounded_int(e.get("max_final_cycles", 2), default=2, minimum=0, maximum=20, name="engine.max_final_cycles"),
+        max_tasks=_bounded_int(e.get("max_tasks", 12), default=12, minimum=1, maximum=256, name="engine.max_tasks"),
+        agent_timeout_seconds=_bounded_int(e.get("agent_timeout_seconds", 3600), default=3600, minimum=1, maximum=86_400, name="engine.agent_timeout_seconds"),
+        gate_timeout_seconds=_bounded_int(e.get("gate_timeout_seconds", 1800), default=1800, minimum=1, maximum=86_400, name="engine.gate_timeout_seconds"),
+        planner_agent=_agent_name(e.get("planner_agent", "codex"), field_name="engine.planner_agent"),
+        reviewer_agent=_agent_name(e.get("reviewer_agent", "claude"), field_name="engine.reviewer_agent"),
+        integrator_agent=_agent_name(e.get("integrator_agent", "codex"), field_name="engine.integrator_agent"),
+        worker_agents=_agent_names(
+            e.get("worker_agents"),
+            default=("codex", "claude", "opencode"),
+            field_name="engine.worker_agents",
+        ),
+        auto_apply=_strict_bool(e.get("auto_apply"), default=False, name="engine.auto_apply"),
+        cleanup_worktrees=_strict_bool(e.get("cleanup_worktrees"), default=True, name="engine.cleanup_worktrees"),
+        execution_profile=execution_profile,
     )
 
     g = _section(data, "git")
     git = GitConfig(
-        require_clean_repo=bool(g.get("require_clean_repo", True)),
-        branch_prefix=str(g.get("branch_prefix", "yolo")),
-        commit_name=str(g.get("commit_name", "Omarchy YOLO")),
-        commit_email=str(g.get("commit_email", "omarchy-yolo@localhost")),
+        require_clean_repo=_strict_bool(g.get("require_clean_repo"), default=True, name="git.require_clean_repo"),
+        branch_prefix=_branch_prefix(g.get("branch_prefix", "yolo")),
+        commit_name=str(g.get("commit_name", "Omarchy YOLO"))[:200],
+        commit_email=str(g.get("commit_email", "omarchy-yolo@localhost"))[:320],
     )
 
     gates_section = _section(data, "gates")
@@ -146,10 +197,13 @@ def load_config(path: Path | None = None) -> Config:
     )
 
     s = _section(data, "sandbox")
+    backend = str(s.get("backend", "native"))
+    if backend not in {"native", "none", "bwrap"}:
+        raise YoloError("sandbox.backend must be 'native', 'none', or 'bwrap'")
     sandbox = SandboxConfig(
-        backend=str(s.get("backend", "native")),
-        network=bool(s.get("network", True)),
-        read_only_home=bool(s.get("read_only_home", False)),
+        backend=backend,
+        network=_strict_bool(s.get("network"), default=True, name="sandbox.network"),
+        read_only_home=_strict_bool(s.get("read_only_home"), default=False, name="sandbox.read_only_home"),
     )
 
     agents_section = _section(data, "agents")
@@ -159,14 +213,17 @@ def load_config(path: Path | None = None) -> Config:
         if not isinstance(raw, dict):
             raw = {}
         agents[name] = AgentConfig(
-            enabled=bool(raw.get("enabled", name != "gemini")),
+            enabled=_strict_bool(raw.get("enabled"), default=name != "gemini", name=f"agents.{name}.enabled"),
             command=_tuple_str(raw.get("command"), default_cmd),
         )
     for name, raw in agents_section.items():
-        if name in agents or not isinstance(raw, dict):
+        safe_name = _agent_name(name, field_name=f"agents.{name}")
+        if safe_name in agents or not isinstance(raw, dict):
             continue
-        agents[name] = AgentConfig(
-            enabled=bool(raw.get("enabled", True)),
+        agents[safe_name] = AgentConfig(
+            enabled=_strict_bool(
+                raw.get("enabled"), default=True, name=f"agents.{safe_name}.enabled"
+            ),
             command=_tuple_str(raw.get("command")),
         )
 

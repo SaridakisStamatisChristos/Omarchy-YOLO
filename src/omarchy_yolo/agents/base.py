@@ -9,7 +9,9 @@ from ..config import AgentConfig, Config
 from ..model import AgentResult
 from ..process import ProcessRunner
 from ..sandbox import Sandbox
-from ..util import YoloError
+from ..util import YoloError, truncate_utf8
+
+MAX_PROMPT_ARG_BYTES = 120_000
 
 
 class AgentLike(Protocol):
@@ -46,51 +48,52 @@ class CommandAgent:
     def available(self) -> bool:
         return bool(self.config.enabled and self.config.command and shutil.which(self.config.command[0]))
 
+    @staticmethod
+    def _strip_option_with_value(argv: list[str], option: str) -> list[str]:
+        result: list[str] = []
+        skip_next = False
+        prefix = option + "="
+        for token in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if token == option:
+                skip_next = True
+                continue
+            if token.startswith(prefix):
+                continue
+            result.append(token)
+        return result
+
     def command_for_profile(self, execution_profile: str) -> list[str]:
         argv = list(self.config.command)
         if execution_profile == "review":
             if self.name == "codex":
-                filtered: list[str] = []
-                skip_next = False
-                for index, token in enumerate(argv):
-                    if skip_next:
-                        skip_next = False
-                        continue
-                    if token == "--dangerously-bypass-approvals-and-sandbox":
-                        continue
-                    if token == "--sandbox" and index + 1 < len(argv):
-                        skip_next = True
-                        continue
-                    filtered.append(token)
-                filtered.extend(["--sandbox", "read-only"])
-                return filtered
+                argv = [
+                    token
+                    for token in argv
+                    if token not in {"--dangerously-bypass-approvals-and-sandbox", "--full-auto"}
+                ]
+                argv = self._strip_option_with_value(argv, "--sandbox")
+                argv.extend(["--sandbox", "read-only"])
+                return argv
             if self.name == "claude":
-                filtered = [token for token in argv if token != "--dangerously-skip-permissions"]
-                if "--permission-mode" not in filtered:
-                    filtered.extend(["--permission-mode", "plan"])
-                return filtered
+                argv = [token for token in argv if token != "--dangerously-skip-permissions"]
+                argv = self._strip_option_with_value(argv, "--permission-mode")
+                argv.extend(["--permission-mode", "plan"])
+                return argv
             return argv
 
         if execution_profile != "danger-yolo" or self.name != "codex":
             return argv
-        # Codex's configured default is bounded workspace full-auto. `danger-yolo` explicitly
-        # selects its no-sandbox/no-approval switch. Other agents' default Omarchy-style commands
-        # already use their unattended modes.
-        filtered = []
-        skip_next = False
-        for index, token in enumerate(argv):
-            if skip_next:
-                skip_next = False
-                continue
-            if token == "--full-auto":
-                continue
-            if token == "--sandbox" and index + 1 < len(argv):
-                skip_next = True
-                continue
-            filtered.append(token)
-        if "--dangerously-bypass-approvals-and-sandbox" not in filtered:
-            filtered.append("--dangerously-bypass-approvals-and-sandbox")
-        return filtered
+        argv = [
+            token
+            for token in argv
+            if token not in {"--full-auto", "--dangerously-bypass-approvals-and-sandbox"}
+        ]
+        argv = self._strip_option_with_value(argv, "--sandbox")
+        argv.append("--dangerously-bypass-approvals-and-sandbox")
+        return argv
 
     def environment_for_profile(self, execution_profile: str) -> dict[str, str]:
         if execution_profile != "review" or self.name != "opencode":
@@ -123,13 +126,18 @@ class CommandAgent:
         env.update(self.environment_for_profile(execution_profile))
         if extra_env:
             env.update(extra_env)
+        bounded_prompt = truncate_utf8(
+            prompt,
+            MAX_PROMPT_ARG_BYTES,
+            marker="\n...[prompt truncated by orchestrator]...\n",
+        )
         raw = await self.runner.run(
             argv,
             cwd=cwd,
             timeout_seconds=timeout_seconds,
             log_path=log_path,
             env=env,
-            prompt_arg=prompt,
+            prompt_arg=bounded_prompt,
         )
         return AgentResult(
             returncode=raw.returncode,
@@ -156,17 +164,21 @@ class CommandAgent:
                     continue
                 self._collect_text(value, texts)
             if texts:
-                return "\n".join(texts)
+                return truncate_utf8("\n".join(texts), 262_144)
         return stdout
 
-    @classmethod
-    def _collect_text(cls, value: object, target: list[str]) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key in {"text", "result", "content"} and isinstance(child, str):
-                    target.append(child)
-                else:
-                    cls._collect_text(child, target)
-        elif isinstance(value, list):
-            for child in value:
-                cls._collect_text(child, target)
+    @staticmethod
+    def _collect_text(value: object, target: list[str]) -> None:
+        stack: list[object] = [value]
+        visited = 0
+        while stack and visited < 10_000:
+            current = stack.pop()
+            visited += 1
+            if isinstance(current, dict):
+                for key, child in current.items():
+                    if key in {"text", "result", "content"} and isinstance(child, str):
+                        target.append(child)
+                    elif isinstance(child, (dict, list)):
+                        stack.append(child)
+            elif isinstance(current, list):
+                stack.extend(reversed(current))
