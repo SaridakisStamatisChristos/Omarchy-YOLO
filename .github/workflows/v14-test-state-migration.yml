@@ -1,0 +1,102 @@
+name: v14-test-state-migration
+
+on:
+  push:
+    branches: [feature/v1.4-formal-reliability]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feature/v1.4-formal-reliability
+      - name: Migrate legacy state-seeding fixtures and self-remove
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str, count: int = 1) -> None:
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f"{path}: expected {count} matches, got {actual}: {old!r}")
+              p.write_text(text.replace(old, new, count))
+
+          replace(
+              "tests/test_daemon.py",
+              "    daemon.db.update_job(job.id, state=JobState.COMPLETED)\n",
+              "    daemon.db.update_job(job.id, state=JobState.RUNNING)\n"
+              "    daemon.db.update_job(job.id, state=JobState.COMPLETED)\n",
+          )
+          replace(
+              "tests/test_db.py",
+              "    db.update_task(task.id, state=TaskState.REVIEWING, attempts=3, last_error=\"useful context\")\n",
+              "    db.update_task(task.id, state=TaskState.RUNNING, attempts=3, last_error=\"useful context\")\n"
+              "    db.update_task(task.id, state=TaskState.REVIEWING)\n",
+          )
+          replace(
+              "tests/test_integration_semantics_v12.py",
+              "    task = db.get_task(task.id)\n    orchestrator = Orchestrator(config, db)\n",
+              "    db.update_task(task.id, state=TaskState.RUNNING)\n"
+              "    db.update_task(task.id, state=TaskState.REVIEWING)\n"
+              "    task = db.get_task(task.id)\n    orchestrator = Orchestrator(config, db)\n",
+          )
+          replace(
+              "tests/test_release_invariants_v11.py",
+              "    db.update_task(task.id, state=TaskState.COMPLETED, result_summary=\"done\")\n",
+              "    db.update_task(task.id, state=TaskState.RUNNING)\n"
+              "    db.update_task(task.id, state=TaskState.REVIEWING)\n"
+              "    db.update_task(task.id, state=TaskState.INTEGRATING)\n"
+              "    db.update_task(task.id, state=TaskState.COMPLETED, result_summary=\"done\")\n",
+          )
+          replace(
+              "tests/test_resilience_v13.py",
+              "        db.update_task(completed.id, state=TaskState.COMPLETED)\n",
+              "        db.update_task(completed.id, state=TaskState.RUNNING)\n"
+              "        db.update_task(completed.id, state=TaskState.REVIEWING)\n"
+              "        db.update_task(completed.id, state=TaskState.INTEGRATING)\n"
+              "        db.update_task(completed.id, state=TaskState.COMPLETED)\n",
+          )
+          replace(
+              "tests/test_resilience_v13.py",
+              "    db.update_task(task.id, state=TaskState.COMPLETED, result_summary=\"accepted\")\n",
+              "    db.update_task(task.id, state=TaskState.RUNNING)\n"
+              "    db.update_task(task.id, state=TaskState.REVIEWING)\n"
+              "    db.update_task(task.id, state=TaskState.INTEGRATING)\n"
+              "    db.update_task(task.id, state=TaskState.COMPLETED, result_summary=\"accepted\")\n",
+              count=2,
+          )
+          # Cancellation-integration fixture must enter the same pre-integration state
+          # as the real task pipeline before calling _integrate_task directly.
+          anchor = "    orchestrator = Orchestrator(config, db)\n    merge_visible = asyncio.Event()\n"
+          replace(
+              "tests/test_resilience_v13.py",
+              anchor,
+              "    db.update_task(task.id, state=TaskState.RUNNING)\n"
+              "    db.update_task(task.id, state=TaskState.REVIEWING)\n"
+              + anchor,
+          )
+
+          # The old one-second process-group test was a scheduler race: a heavily
+          # loaded runner could time out before bash executed its first echo. Three
+          # seconds preserves the timeout/kill assertion without changing production.
+          replace(
+              "tests/test_critical_paths_v12.py",
+              "        timeout_seconds=1,\n        log_path=tmp_path / \"timeout.log\",\n",
+              "        timeout_seconds=3,\n        log_path=tmp_path / \"timeout.log\",\n",
+          )
+
+          Path('.github/workflows/v14-test-state-migration.yml').unlink()
+          PY
+          git config user.name 'Omarchy YOLO CI'
+          git config user.email 'omarchy-yolo@localhost'
+          git add tests .github/workflows/v14-test-state-migration.yml
+          git diff --cached --check
+          git commit -m 'test: seed legacy fixtures through legal state transitions'
+          git push origin HEAD:feature/v1.4-formal-reliability
