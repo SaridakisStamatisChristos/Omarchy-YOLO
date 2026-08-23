@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Iterable
@@ -16,6 +17,7 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
+PRAGMA trusted_schema=OFF;
 
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
@@ -48,9 +50,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   attempts INTEGER NOT NULL DEFAULT 0,
   branch TEXT NOT NULL DEFAULT '',
   worktree TEXT NOT NULL DEFAULT '',
-  base_commit TEXT NOT NULL DEFAULT ''
+  base_commit TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
-  result_summary TEXT NOT NULL DEFAULT ''
+  result_summary TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   UNIQUE(job_id, logical_id)
@@ -84,17 +86,24 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_job_state ON tasks(job_id, state);
 CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id, id);
-CREATE TABLE IF NOT EXISTS id_jobs_created ON jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
+
+MAX_JOB_LIST_LIMIT = 200
+MAX_EVENT_LIST_LIMIT = 100
+MAX_EVENT_PAYLOAD_CHARS = 8_000
 
 
 class Database:
     def __init__(self, path: Path):
         ensure_private_dir(path.parent)
         self.path = path
+        if path.is_symlink():
+            raise RuntimeError(f"refusing symlink for database path: {path}")
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        os.chmod(path, 0o600)
         with self._lock:
             self._conn.executescript(SCHEMA)
 
@@ -106,9 +115,6 @@ class Database:
         with self._lock:
             return self._conn.execute(sql, params)
 
-    def _transaction(self) -> sqlite3.Connection:
-        return self._conn
-
     def create_job(
         self,
         *,
@@ -118,7 +124,7 @@ class Database:
         base_commit: str,
         integration_branch: str,
         auto_apply: bool,
-     ) -> JobRecord:
+    ) -> JobRecord:
         now = utc_ts()
         job_id = new_id("job")
         with self._lock:
@@ -165,8 +171,9 @@ class Database:
         return self._job_from_row(row) if row is not None else None
 
     def list_jobs(self, limit: int = 50) -> list[JobRecord]:
+        bounded = min(MAX_JOB_LIST_LIMIT, max(1, limit))
         rows = self._execute(
-            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (max(1, limit),)
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (bounded,)
         ).fetchall()
         return [self._job_from_row(row) for row in rows]
 
@@ -236,7 +243,7 @@ class Database:
     def list_tasks(self, job_id: str) -> list[TaskRecord]:
         rows = self._execute(
             "SELECT * FROM tasks WHERE job_id = ? ORDER BY seq", (job_id,)
-       ).fetchall()
+        ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
     def get_task(self, task_id: str) -> TaskRecord:
@@ -248,7 +255,7 @@ class Database:
     def get_task_by_logical_id(self, job_id: str, logical_id: str) -> TaskRecord:
         row = self._execute(
             "SELECT * FROM tasks WHERE job_id = ? AND logical_id = ?", (job_id, logical_id)
-        ).fetchone()
+       ).fetchone()
         if row is None:
             raise KeyError((job_id, logical_id))
         return self._task_from_row(row)
@@ -273,7 +280,7 @@ class Database:
         if isinstance(values.get("state"), TaskState):
             values["state"] = values["state"].value
         values["updated_at"] = utc_ts()
-        assignments = ", ".join(f"{key} = ?" for key in values)
+        assignments = ", ".join(f"{} = ?".format(key) for key in values)
         params = tuple(values.values()) + (task_id,)
         self._execute(f"UPDATE tasks SET {assignments} WHERE id = ?", params)
 
@@ -324,19 +331,28 @@ class Database:
         *,
         task_id: str | None = None,
     ) -> int:
+        encoded_payload = json_dumps(payload or {})
+        if len(encoded_payload) > MAX_EVENT_PAYLOAD_CHARS:
+            encoded_payload = json_dumps(
+                {
+                    "truncated": True,
+                    "preview": encoded_payload[: MAX_EVENT_PAYLOAD_CHARS - 100],
+                }
+            )
         cur = self._execute(
             "INSERT INTO events(job_id, task_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-            (job_id, task_id, kind, json_dumps(payload or {}), utc_ts()),
+            (job_id, task_id, kind[:128], encoded_payload, utc_ts()),
         )
         return int(cur.lastrowid)
 
     def events(self, job_id: str, *, after_id: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+        bounded = min(MAX_EVENT_LIST_LIMIT, max(1, limit))
         rows = self._execute(
             """
             SELECT id, job_id, task_id, kind, payload, created_at
             FROM events WHERE job_id = ? AND id > ? ORDER BY id LIMIT ?
             """,
-            (job_id, max(0, after_id), max(1, limit)),
+            (job_id, max(0, after_id), bounded),
         ).fetchall()
         return [
             {
@@ -351,7 +367,7 @@ class Database:
         ]
 
     def last_event_id(self, job_id: str) -> int:
-        row = self._execute("SELECT COALESCE+MAX(id), 0) AS id FROM events WHERE job_id = ?", (job_id,)).fetchone()
+        row = self._execute("SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE job_id = ?", (job_id,)).fetchone()
         return int(row["id"]) if row is not None else 0
 
     def request_stop(self, job_id: str) -> None:
@@ -363,110 +379,114 @@ class Database:
         self.event(job_id, "job.resumed")
 
     def retry_failed_tasks(self, job_id: str) -> None:
+        """Compatibility helper: make all non-completed task states schedulable again."""
+        now = utc_ts()
         self._execute(
             """
-            UPDATE tasks SET state = ?, last_error = '', updated_at = ?
-            WHERE job_id = ? AND state IN (?, ?, ?)
+            UPDATE tasks SET state = ?, updated_at = ?
+            WHERE job_id = ? AND state != ?
             """,
-            (
-                TaskState.PENDING.value,
-                utc_ts(),
-                job_id,
-                TaskState.FAILED.value,
-                TaskState.BLOCKED.value,
-                TaskState.STOPPED.value,
-            ),
+            (TaskState.PENDING.value, now, job_id, TaskState.COMPLETED.value),
         )
 
-    def recover_incomplete(self) -> list[str]:
-        """Make interrupted jobs schedulable after a daemon restart."""
-        terminal = (JobState.COMPLETED.value, JobState.FAILED.value, JobState.STOPPED.value)
+    def settle_inflight(
+        self,
+        job_id: str,
+        *,
+        task_state: TaskState,
+        attempt_state: str,
+        summary: str,
+    ) -> None:
+        """Durably close in-flight attempts/tasks after stop, interruption, or fatal failure."""
+        if task_state not in {TaskState.PENDING, TaskState.FAILED, TaskState.STOPPED}:
+            raise ValueError(f"invalid settled task state: {task_state}")
+        if attempt_state not in {"cancelled", "failed"}:
+            raise ValueError(f"invalid settled attempt state: {attempt_state}")
+        bounded_summary = summary[-9_000:]
+        now = utc_ts()
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id FROM jobs WHERE state NOT IN (?, ?, ?)" terminal
-            ).fetchall()
-            ids = [str(row["id"]) for row in rows]
-            if not ids:
-                return []
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                placeholders = ",".join("?" for _ in ids)
                 self._conn.execute(
-                    f"""
-                    UPDATE tasks SET state = ?, updated_at = ?
-                    WHERE job_id IN ({placeholders})
-                      AND state IN (?, ?, ?)
+                    """
+                    UPDATE attempts
+                    SET state = ?, finished_at = ?,
+                        summary = CASE WHEN summary = '' THEN ? ELSE summary END
+                    WHERE job_id = ? AND state = 'running'
+                    """,
+                    (attempt_state, now, bounded_summary, job_id),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?,
+                        last_error = CASE WHEN ? = '' THEN last_error ELSE ? END,
+                        updated_at = ?
+                    WHERE job_id = ? AND state IN (?, ?, ?)
                     """,
                     (
-                        TaskState.PENDING.value,
-                        utc_ts(),
-                        *ids,
-                        TaskState.RUNNING..value,
+                        task_state.value,
+                        bounded_summary,
+                        bounded_summary,
+                        now,
+                        job_id,
+                        TaskState.RUNNING.value,
                         TaskState.REVIEWING.value,
-                        TaskState.INTEGRATING..value,
+                        TaskState.INTEGRATING.value,
                     ),
-                )
-                now = utc_ts()
-                self._conn.execute(
-                    f"""
-                    UPDATE attempts
-                    SET state = 'cancelled', finished_at = ?,
-                        summary = CASE
-                          WHEN summary = '' THEN 'interrupted by daemon restart'
-                          ELSE summary
-                        END
-                    WHERE job_id IN ({placeholders}) AND state = 'running'
-                    """,
-                    (now, *ids),
-                )
-                self._conn.execute(
-                    f"UPDATE jobs SET state = ?, stop_requested = 0, updated_at = ? WHERE id IN ({placeholders})",
-                    (JobState.QUEUED.value, now, *ids),
                 )
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-        for job_id in ids:
-            self.event(job_id, "job.recovered")
-        return ids
 
-    @staticmethod
-    def _job_from_row(row: sqlite3.Row) -> JobRecord:
-        return JobRecord(
-            id=str(row["id"]),
-            repo=str(row["repo"]),
-            goal=str(row["goal"]),
-            state=JobState(str(row["state"])),
-            base_branch=str(row["base_branch"]),
-            base_commit=str(row["base_commit"]),
-            integration_branch=str(row["integration_branch"]),
-            integration_path=str(row["integration_path"]),
-            auto_apply=bool(row["auto_apply"]),
-            stop_requested=bool(row["stop_requested"]),
-            created_at=float(row["created_at"]),
-            updated_at=float(row["updated_at"]),
-            final_summary=str(row["final_summary"]),
-            error=str(row["error"]),
-        )
+    def prepare_resume(self, job_id: str) -> None:
+        """Atomically close stale attempts and make a stopped/failed job schedulable."""
+        self.get_job(job_id)
+        now = utc_ts()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    UPDATE attempts
+                    SET state = 'cancelled', finished_at = ?,
+                        summary = CASE
+                          WHEN summary = '' THEN 'cancelled before explicit resume'
+                          ELSE summary
+                        END
+                    WHERE job_id = ? AND state = 'running'
+                    """,
+                    (now, job_id),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE tasks SET state = ?, updated_at = ?
+                    WHERE job_id = ? AND state != ?
+                    """,
+                    (TaskState.PENDING.value, now, job_id, TaskState.COMPLETED.value),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE jobs SET state = ?, stop_requested = 0, error = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (JobState.QUEUED.value, now, job_id),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        self.event(job_id, "job.resumed")
 
-    @staticmethod
-    def _task_from_row(row: sqlite3.Row) -> TaskRecord:
-        return TaskRecord(
-            id=str(row["id"]),
-            job_id=str(row["job_id"]),
-            seq=int(row["seq"]),
-            logical_id=str(row["logical_id"]),
-            title=str(row["title"]),
-            description=str(row["description"]),
-            state=TaskState(str(row["state"])),
-            dependencies=tuple(str(x) for x in json.loads(row["dependencies"])),
-            acceptance=tuple(str(x) for x in json.loads(row["acceptance"])),
-            preferred_agent=(str(row["preferred_agent"]) if row["preferred_agent"] else None),
-            attempts=int(row["attempts"]),
-            branch=str(row["branch"]),
-            worktree=str(row["worktree"]),
-            base_commit=str(row["base_commit"]),
-            last_error=str(row["last_error"]),
-            result_summary=str(row["result_summary"]),
-        )
+    def recover_incomplete(self) -> list[str]:
+        """Recover interrupted jobs while preserving an explicit stop across daemon restarts."""
+        terminal = (JobState.COMPLETED.value, JobState.FAILED.value, JobState.STOPPED.value)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, state, stop_requested FROM jobs WHERE state NOT IN (?, ?, ?)", terminal
+            ).fetchall()
+            active_ids = [
+                str(row["id"])
+                for row in rows
+                if not bool(row["stop_requested"]) and str(row["state"]) != JobState.STOPPING.
