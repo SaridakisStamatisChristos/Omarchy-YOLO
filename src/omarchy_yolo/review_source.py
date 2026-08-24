@@ -58,12 +58,7 @@ _ENCODED_PATH_PREFIX = "json:"
 
 
 def _display_path(path: str) -> str:
-    """Return an injective, single-line representation safe for model prompts.
-
-    Ordinary project paths remain readable and backward compatible. Exotic paths
-    use an explicitly tagged JSON string; reserving the tag for encoded values
-    makes the representation collision-free.
-    """
+    """Return an injective, single-line representation safe for model prompts."""
     if _PLAIN_PROMPT_PATH_RE.fullmatch(path) and not path.startswith(_ENCODED_PATH_PREFIX):
         return path
     return _ENCODED_PATH_PREFIX + json.dumps(path, ensure_ascii=True)
@@ -181,44 +176,23 @@ def build_review_chunks(
     *,
     max_files: int,
     chunk_bytes: int,
-    chunk_files: int,
     allow_binary: bool = False,
 ) -> tuple[list[str], list[ReviewChunk]]:
-    if chunk_files < 1:
-        raise ValueError("chunk_files must be positive")
+    """Build byte-bounded, strictly file-local raw review shards.
+
+    The previous ``chunk_files`` option was misleading: hierarchical correctness
+    requires raw shards to remain file-local before per-file synthesis. v1.4.2
+    removes that dead configuration surface and makes the invariant explicit.
+    """
     actual_files = changed_files(repo, cwd, base, max_files=max_files)
     if not actual_files:
         return [], [ReviewChunk(index=1, files=(), text="No changed files.")]
 
     manifest = [_display_path(path) for path in actual_files]
     chunks: list[ReviewChunk] = []
-    current_parts: list[str] = []
-    current_files: list[str] = []
-    current_bytes = 0
     total_bytes = 0
 
-    def flush() -> None:
-        nonlocal current_parts, current_files, current_bytes
-        if not current_parts:
-            return
-        unique_files = tuple(dict.fromkeys(current_files))
-        if len(unique_files) > 1:
-            raise YoloError("internal review invariant violated: a shard spans multiple files")
-        chunks.append(
-            ReviewChunk(
-                index=len(chunks) + 1,
-                files=unique_files,
-                text="".join(current_parts),
-            )
-        )
-        current_parts = []
-        current_files = []
-        current_bytes = 0
-
     for path in actual_files:
-        # Keep every raw shard file-local. This lets the next hierarchy stage synthesize
-        # all pieces of one file before global cross-file reasoning.
-        flush()
         display_path = _display_path(path)
         binary = _is_binary_change(repo, cwd, base, path)
         if binary and not allow_binary:
@@ -247,15 +221,15 @@ def build_review_chunks(
                 f"\n===== FILE {display_path} PART {part_number}/{len(pieces)} =====\n"
             )
             payload = header + piece
-            payload_bytes = len(payload.encode("utf-8"))
-            if current_parts and current_bytes + payload_bytes > chunk_bytes:
-                flush()
-            if payload_bytes > chunk_bytes:
+            if len(payload.encode("utf-8")) > chunk_bytes:
                 raise YoloError(
                     f"review chunk construction exceeded byte limit for {display_path}"
                 )
-            current_parts.append(payload)
-            current_files.append(display_path)
-            current_bytes += payload_bytes
-        flush()
+            chunks.append(
+                ReviewChunk(
+                    index=len(chunks) + 1,
+                    files=(display_path,),
+                    text=payload,
+                )
+            )
     return manifest, chunks
