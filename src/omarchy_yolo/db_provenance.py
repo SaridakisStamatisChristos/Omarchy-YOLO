@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -7,6 +8,11 @@ from .db_core import DatabaseCore
 from .model import JobState, TaskState
 from .state_machine import StateTransitionError, validate_job_snapshot, validate_job_transition
 from .util import json_dumps, utc_ts
+
+
+def _digest_matches(content: str, expected: str) -> bool:
+    actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return len(expected) == 64 and actual == expected
 
 
 class ProvenanceMixin(DatabaseCore):
@@ -105,6 +111,10 @@ class ProvenanceMixin(DatabaseCore):
         content: str,
     ) -> None:
         """Persist an accepted candidate dossier without making it externally visible."""
+        if schema_version < 1:
+            raise ValueError("dossier schema_version must be positive")
+        if not _digest_matches(content, sha256):
+            raise StateTransitionError("refusing dossier whose SHA-256 does not match its content")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -219,7 +229,7 @@ class ProvenanceMixin(DatabaseCore):
 
                 dossier = self._conn.execute(
                     """
-                    SELECT schema_version, sha256, published
+                    SELECT schema_version, sha256, content, published
                     FROM dossiers WHERE job_id = ?
                     """,
                     (job_id,),
@@ -230,6 +240,8 @@ class ProvenanceMixin(DatabaseCore):
                     raise StateTransitionError("staged dossier schema version changed before publication")
                 if str(dossier["sha256"]) != dossier_sha256:
                     raise StateTransitionError("staged dossier digest changed before publication")
+                if not _digest_matches(str(dossier["content"]), dossier_sha256):
+                    raise StateTransitionError("staged dossier content failed SHA-256 verification")
 
                 if current == JobState.COMPLETED:
                     if bool(dossier["published"]):
