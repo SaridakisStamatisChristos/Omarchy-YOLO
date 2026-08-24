@@ -18,6 +18,7 @@ of the source branch is opt-in and is refused if the source branch has moved or 
 
 ## Documentation
 
+- [Why Omarchy YOLO Exists](docs/WHY_OMARCHY_YOLO.md) — the problem statement, architectural intent, non-goals and decision filter for future changes.
 - [How Omarchy YOLO Works](docs/HOW_IT_WORKS.md) — end-to-end lifecycle and mental model.
 - [Operator Guide](docs/OPERATOR_GUIDE.md) — installation verification, running jobs, stop/resume, logs/events, dossiers, recovery and troubleshooting.
 - [Configuration Reference](docs/CONFIGURATION.md) — every supported configuration field, validation range, interaction and recommended profile.
