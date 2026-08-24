@@ -26,10 +26,6 @@ class Sandbox:
         if not executable:
             raise YoloError("sandbox backend 'bwrap' requested but bubblewrap is not installed")
 
-        # The host root is read-only. Reviewers receive a read-only worktree. Gate
-        # commands need to write build/test artifacts inside the repository, so their cwd
-        # stays writable, but HOME remains read-only and no arbitrary host path is rebound.
-        # Workers retain the configurable HOME policy needed by interactive coding CLIs.
         review_mode = execution_profile == "review"
         gate_mode = execution_profile == "gate"
         cwd_bind = "--ro-bind" if review_mode else "--bind"
@@ -115,8 +111,7 @@ class Sandbox:
             and not review_mode
             and not gate_mode
         ):
-            effective_read_only_home = self.config.read_only_home
-            if not effective_read_only_home:
+            if not self.config.read_only_home:
                 wrapped.extend(["--bind", str(home), str(home)])
             else:
                 for relative in self.config.writable_home_paths:
@@ -129,7 +124,7 @@ class Sandbox:
                         ) from exc
                     if candidate.exists():
                         wrapped.extend(["--bind", str(candidate), str(candidate)])
-        if not self.config.network or (self.config.hostile_repo_mode and gate_mode):
+        if not self.config.network_for(execution_profile):
             wrapped.append("--unshare-net")
         wrapped.extend(["--", *argv])
         return wrapped
