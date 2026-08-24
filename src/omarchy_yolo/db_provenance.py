@@ -110,7 +110,7 @@ class ProvenanceMixin(DatabaseCore):
         sha256: str,
         content: str,
     ) -> None:
-        """Persist an accepted candidate dossier without making it externally visible."""
+        """Persist a candidate dossier privately before acceptance begins."""
         if schema_version < 1:
             raise ValueError("dossier schema_version must be positive")
         if not _digest_matches(content, sha256):
@@ -119,33 +119,50 @@ class ProvenanceMixin(DatabaseCore):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 job = self._conn.execute(
-                    "SELECT state FROM jobs WHERE id = ?", (job_id,)
+                    "SELECT state, acceptance_phase FROM jobs WHERE id = ?", (job_id,)
                 ).fetchone()
                 if job is None:
                     raise KeyError(job_id)
-                if JobState(str(job["state"])) == JobState.COMPLETED:
-                    raise StateTransitionError("cannot replace dossier for a completed job")
-                self._conn.execute(
-                    """
-                    INSERT INTO dossiers(
-                      job_id, schema_version, sha256, content, published, created_at
-                    ) VALUES (?, ?, ?, ?, 0, ?)
-                    ON CONFLICT(job_id) DO UPDATE SET
-                      schema_version = excluded.schema_version,
-                      sha256 = excluded.sha256,
-                      content = excluded.content,
-                      published = 0,
-                      created_at = excluded.created_at
-                    """,
-                    (job_id, schema_version, sha256, content, utc_ts()),
+                phase = str(job["acceptance_phase"])
+                if JobState(str(job["state"])) == JobState.COMPLETED or phase != "none":
+                    raise StateTransitionError(
+                        f"cannot replace dossier after acceptance begins ({phase})"
+                    )
+                self._stage_dossier_locked(
+                    job_id,
+                    schema_version=schema_version,
+                    sha256=sha256,
+                    content=content,
                 )
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    # Compatibility name retained for callers from v1.4.0. A store is now a
-    # private stage; only publish_completed_job can make it externally visible.
+    def _stage_dossier_locked(
+        self,
+        job_id: str,
+        *,
+        schema_version: int,
+        sha256: str,
+        content: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO dossiers(
+              job_id, schema_version, sha256, content, published, created_at
+            ) VALUES (?, ?, ?, ?, 0, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+              schema_version = excluded.schema_version,
+              sha256 = excluded.sha256,
+              content = excluded.content,
+              published = 0,
+              created_at = excluded.created_at
+            """,
+            (job_id, schema_version, sha256, content, utc_ts()),
+        )
+
+    # Compatibility name retained for callers from v1.4.0.
     def store_dossier(
         self,
         job_id: str,
@@ -160,6 +177,189 @@ class ProvenanceMixin(DatabaseCore):
             sha256=sha256,
             content=content,
         )
+
+    def prepare_accepted_job(
+        self,
+        job_id: str,
+        *,
+        accepted_commit: str,
+        final_summary: str,
+        source_apply_intent: str,
+        dossier_schema_version: int,
+        dossier_sha256: str,
+        dossier_content: str,
+    ) -> None:
+        """Durably journal acceptance before any source-branch Git side effect.
+
+        The accepted commit, apply intent and staged dossier become durable in the
+        same transaction. A hard crash after this point is therefore recoverable:
+        startup can resume from ``accepted``/``applying`` without re-planning or
+        re-running semantic acceptance.
+        """
+        if source_apply_intent not in {"requested", "not-requested"}:
+            raise ValueError(f"invalid source apply intent: {source_apply_intent}")
+        if not accepted_commit or len(accepted_commit) > 128:
+            raise ValueError("accepted_commit must be a non-empty bounded Git object id")
+        if dossier_schema_version < 1:
+            raise ValueError("dossier schema_version must be positive")
+        if not _digest_matches(dossier_content, dossier_sha256):
+            raise StateTransitionError("refusing accepted dossier with invalid SHA-256")
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                job = self._conn.execute(
+                    """
+                    SELECT state, acceptance_phase, accepted_commit,
+                           source_apply_intent, final_summary
+                    FROM jobs WHERE id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if job is None:
+                    raise KeyError(job_id)
+                current = JobState(str(job["state"]))
+                phase = str(job["acceptance_phase"])
+                if phase in {"accepted", "applying"}:
+                    dossier = self._conn.execute(
+                        "SELECT schema_version, sha256, content FROM dossiers WHERE job_id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    same = (
+                        str(job["accepted_commit"]) == accepted_commit
+                        and str(job["source_apply_intent"]) == source_apply_intent
+                        and str(job["final_summary"]) == final_summary
+                        and dossier is not None
+                        and int(dossier["schema_version"]) == dossier_schema_version
+                        and str(dossier["sha256"]) == dossier_sha256
+                        and str(dossier["content"]) == dossier_content
+                    )
+                    if same:
+                        self._conn.execute("COMMIT")
+                        return
+                    raise StateTransitionError(
+                        "accepted job metadata changed across idempotent preparation"
+                    )
+                if phase != "none":
+                    raise StateTransitionError(
+                        f"cannot prepare acceptance from phase {phase}"
+                    )
+                if current not in {JobState.RUNNING, JobState.STOPPING}:
+                    raise StateTransitionError(
+                        f"acceptance requires running/stopping job, got {current.value}"
+                    )
+                validate_job_transition(current, JobState.COMPLETED)
+
+                _, task_states, running_owners, _, _ = self._snapshot_locked(job_id)
+                validate_job_snapshot(
+                    current,
+                    task_states,
+                    stop_requested=False,
+                    running_attempt_task_states=running_owners,
+                    acceptance_phase="accepted",
+                )
+                self._stage_dossier_locked(
+                    job_id,
+                    schema_version=dossier_schema_version,
+                    sha256=dossier_sha256,
+                    content=dossier_content,
+                )
+                now = utc_ts()
+                cur = self._conn.execute(
+                    """
+                    UPDATE jobs
+                    SET accepted_commit = ?, acceptance_phase = 'accepted',
+                        source_apply_intent = ?, source_apply_outcome = '',
+                        source_apply_reason = '', final_summary = ?, error = '',
+                        stop_requested = 0, updated_at = ?
+                    WHERE id = ? AND acceptance_phase = 'none' AND state = ?
+                    """,
+                    (
+                        accepted_commit,
+                        source_apply_intent,
+                        final_summary,
+                        now,
+                        job_id,
+                        current.value,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise StateTransitionError(
+                        f"stale job state while journaling acceptance for {job_id}"
+                    )
+                self._conn.execute(
+                    "INSERT INTO events(job_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        job_id,
+                        "job.accepted",
+                        json_dumps(
+                            {
+                                "accepted_commit": accepted_commit,
+                                "source_apply_intent": source_apply_intent,
+                                "dossier_sha256": dossier_sha256,
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                self._validate_snapshot_locked(job_id)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def mark_apply_started(self, job_id: str, *, accepted_commit: str) -> None:
+        """Persist APPLYING before touching the user's source branch."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT acceptance_phase, accepted_commit, source_apply_intent
+                    FROM jobs WHERE id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(job_id)
+                phase = str(row["acceptance_phase"])
+                if str(row["accepted_commit"]) != accepted_commit:
+                    raise StateTransitionError("accepted commit changed before source application")
+                if str(row["source_apply_intent"]) != "requested":
+                    raise StateTransitionError("source application was not requested")
+                if phase == "applying":
+                    self._conn.execute("COMMIT")
+                    return
+                if phase != "accepted":
+                    raise StateTransitionError(
+                        f"source application requires accepted phase, got {phase}"
+                    )
+                now = utc_ts()
+                cur = self._conn.execute(
+                    """
+                    UPDATE jobs SET acceptance_phase = 'applying', updated_at = ?
+                    WHERE id = ? AND acceptance_phase = 'accepted'
+                    """,
+                    (now, job_id),
+                )
+                if cur.rowcount != 1:
+                    raise StateTransitionError(
+                        f"stale acceptance phase while starting source apply for {job_id}"
+                    )
+                self._conn.execute(
+                    "INSERT INTO events(job_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        job_id,
+                        "job.apply_started",
+                        json_dumps({"accepted_commit": accepted_commit}),
+                        now,
+                    ),
+                )
+                self._validate_snapshot_locked(job_id)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def get_staged_dossier(self, job_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -207,18 +407,17 @@ class ProvenanceMixin(DatabaseCore):
         source_apply_outcome: str,
         source_apply_reason: str = "",
     ) -> None:
-        """Atomically publish the dossier and durable completion state.
-
-        The staged dossier remains invisible until this transaction validates the
-        complete task snapshot, clears stop_requested, transitions the job to
-        completed, marks the dossier published, and records the acceptance events.
-        """
+        """Atomically publish dossier, apply outcome and durable COMPLETED state."""
+        if source_apply_outcome not in {"applied", "skipped", "not-requested"}:
+            raise ValueError(f"invalid source apply outcome: {source_apply_outcome}")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 job = self._conn.execute(
                     """
-                    SELECT state, stop_requested, base_branch, integration_branch
+                    SELECT state, stop_requested, base_branch, integration_branch,
+                           acceptance_phase, accepted_commit, source_apply_intent,
+                           source_apply_outcome
                     FROM jobs WHERE id = ?
                     """,
                     (job_id,),
@@ -226,6 +425,7 @@ class ProvenanceMixin(DatabaseCore):
                 if job is None:
                     raise KeyError(job_id)
                 current = JobState(str(job["state"]))
+                phase = str(job["acceptance_phase"])
 
                 dossier = self._conn.execute(
                     """
@@ -244,41 +444,59 @@ class ProvenanceMixin(DatabaseCore):
                     raise StateTransitionError("staged dossier content failed SHA-256 verification")
 
                 if current == JobState.COMPLETED:
-                    if bool(dossier["published"]):
+                    if bool(dossier["published"]) and phase == "published":
+                        if str(job["source_apply_outcome"]) != source_apply_outcome:
+                            raise StateTransitionError(
+                                "completed job source-apply outcome changed across idempotent publication"
+                            )
                         self._conn.execute("COMMIT")
                         return
-                    raise StateTransitionError("completed job contains an unpublished dossier")
+                    raise StateTransitionError("completed job contains an unpublished acceptance")
+
+                intent = str(job["source_apply_intent"])
+                if intent == "not-requested":
+                    if phase != "accepted" or source_apply_outcome != "not-requested":
+                        raise StateTransitionError(
+                            "non-applied acceptance must publish from accepted/not-requested state"
+                        )
+                elif intent == "requested":
+                    if phase != "applying" or source_apply_outcome not in {"applied", "skipped"}:
+                        raise StateTransitionError(
+                            "requested source application must publish from applying with applied/skipped outcome"
+                        )
+                else:
+                    raise StateTransitionError(f"invalid durable source apply intent: {intent}")
+                if not str(job["accepted_commit"]):
+                    raise StateTransitionError("accepted job is missing accepted_commit")
 
                 validate_job_transition(current, JobState.COMPLETED)
-                task_rows = self._conn.execute(
-                    "SELECT state FROM tasks WHERE job_id = ? ORDER BY seq", (job_id,)
-                ).fetchall()
-                task_states = tuple(TaskState(str(row["state"])) for row in task_rows)
+                _, task_states, running_owners, _, _ = self._snapshot_locked(job_id)
                 validate_job_snapshot(
                     JobState.COMPLETED,
                     task_states,
                     stop_requested=False,
+                    running_attempt_task_states=running_owners,
+                    acceptance_phase="published",
                 )
-                running_attempt = self._conn.execute(
-                    "SELECT 1 FROM attempts WHERE job_id = ? AND state = 'running' LIMIT 1",
-                    (job_id,),
-                ).fetchone()
-                if running_attempt is not None:
-                    raise StateTransitionError("completed job cannot retain a running attempt")
 
                 now = utc_ts()
                 cur = self._conn.execute(
                     """
                     UPDATE jobs
-                    SET state = ?, stop_requested = 0, final_summary = ?, error = '', updated_at = ?
-                    WHERE id = ? AND state = ?
+                    SET state = ?, stop_requested = 0, final_summary = ?, error = '',
+                        acceptance_phase = 'published', source_apply_outcome = ?,
+                        source_apply_reason = ?, updated_at = ?
+                    WHERE id = ? AND state = ? AND acceptance_phase = ?
                     """,
                     (
                         JobState.COMPLETED.value,
                         final_summary,
+                        source_apply_outcome,
+                        source_apply_reason[-4_000:],
                         now,
                         job_id,
                         current.value,
+                        phase,
                     ),
                 )
                 if cur.rowcount != 1:
@@ -304,6 +522,7 @@ class ProvenanceMixin(DatabaseCore):
                             {
                                 "sha256": dossier_sha256,
                                 "schema_version": dossier_schema_version,
+                                "accepted_commit": str(job["accepted_commit"]),
                             }
                         ),
                         now,
@@ -315,7 +534,12 @@ class ProvenanceMixin(DatabaseCore):
                         (
                             job_id,
                             "job.applied",
-                            json_dumps({"branch": str(job["base_branch"])}),
+                            json_dumps(
+                                {
+                                    "branch": str(job["base_branch"]),
+                                    "accepted_commit": str(job["accepted_commit"]),
+                                }
+                            ),
                             now,
                         ),
                     )
@@ -329,8 +553,6 @@ class ProvenanceMixin(DatabaseCore):
                             now,
                         ),
                     )
-                elif source_apply_outcome != "not-requested":
-                    raise ValueError(f"invalid source apply outcome: {source_apply_outcome}")
 
                 self._conn.execute(
                     "INSERT INTO events(job_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
@@ -342,12 +564,14 @@ class ProvenanceMixin(DatabaseCore):
                                 "summary": final_summary,
                                 "branch": str(job["integration_branch"]),
                                 "dossier_sha256": dossier_sha256,
+                                "accepted_commit": str(job["accepted_commit"]),
                                 "source_apply_outcome": source_apply_outcome,
                             }
                         ),
                         now,
                     ),
                 )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
