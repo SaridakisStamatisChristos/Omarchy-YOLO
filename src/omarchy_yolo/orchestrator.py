@@ -92,9 +92,9 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             async with self.coordinator.worker_slot():
                 final_summary = await self._finalize(job_id, repo, integration_path)
             job = self.db.get_job(job_id)
-            # Final review is the acceptance boundary. Every fallible provenance
-            # operation completes before optional source application. The protected
-            # step then finishes application/refusal and durable completion together.
+            # Final review is the acceptance boundary. Dossier bytes are staged
+            # privately before optional source application, then dossier publication
+            # and durable COMPLETED state become visible in one SQLite transaction.
             await finish_before_cancel(
                 self._complete_accepted_job(job, repo, final_summary)
             )
@@ -167,19 +167,15 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             final_summary=final_summary,
             source_apply_intent="requested" if accepted.auto_apply else "not-requested",
         )
-        self.db.store_dossier(
+        self.db.stage_dossier(
             accepted.id,
             schema_version=DOSSIER_SCHEMA_VERSION,
             sha256=dossier_sha256,
             content=dossier_content,
         )
-        self.db.event(
-            accepted.id,
-            "job.dossier_created",
-            {"sha256": dossier_sha256, "schema_version": DOSSIER_SCHEMA_VERSION},
-        )
 
         source_apply_outcome = "not-requested"
+        source_apply_reason = ""
         if accepted.auto_apply:
             try:
                 async with self.coordinator.repo_lock(repo.root):
@@ -190,27 +186,17 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
                         accepted.base_commit,
                     )
                 source_apply_outcome = "applied"
-                self.db.event(accepted.id, "job.applied", {"branch": accepted.base_branch})
             except GitError as exc:
-                source_apply_outcome = f"skipped: {str(exc)[-1_000:]}"
-                self.db.event(accepted.id, "job.apply_skipped", {"reason": str(exc)})
+                source_apply_outcome = "skipped"
+                source_apply_reason = str(exc)
 
-        self.db.update_job(
+        self.db.publish_completed_job(
             accepted.id,
-            state=JobState.COMPLETED,
-            stop_requested=False,
+            dossier_schema_version=DOSSIER_SCHEMA_VERSION,
+            dossier_sha256=dossier_sha256,
             final_summary=final_summary,
-            error="",
-        )
-        self.db.event(
-            accepted.id,
-            "job.completed",
-            {
-                "summary": final_summary,
-                "branch": accepted.integration_branch,
-                "dossier_sha256": dossier_sha256,
-                "source_apply_outcome": source_apply_outcome,
-            },
+            source_apply_outcome=source_apply_outcome,
+            source_apply_reason=source_apply_reason,
         )
         notify(
             "YOLO completed",
