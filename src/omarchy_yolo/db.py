@@ -91,6 +91,10 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                 target = JobState(values.get("state", current))
                 target_stop = bool(values.get("stop_requested", row["stop_requested"]))
                 validate_job_transition(current, target)
+                if target == JobState.COMPLETED and current != JobState.COMPLETED:
+                    raise StateTransitionError(
+                        "completed jobs must be published through publish_completed_job"
+                    )
 
                 values["state"] = target.value if "state" in values else current.value
                 for key in ("stop_requested", "auto_apply"):
