@@ -8,11 +8,18 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
+from .db_schema_contract import (
+    validate_check_constraints,
+    validate_named_indexes,
+    validate_table_columns,
+    validate_unique_constraints,
+)
 from .model import JobRecord, JobState, TaskRecord, TaskState
+from .state_machine import validate_job_snapshot
 from .util import YoloError, ensure_private_dir
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 LEGACY_SCHEMA_VERSION = 1
 
 _PRAGMAS = (
@@ -38,7 +45,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   final_summary TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
-  updated_at REAL NOT NULL
+  updated_at REAL NOT NULL,
+  accepted_commit TEXT NOT NULL DEFAULT '',
+  acceptance_phase TEXT NOT NULL DEFAULT 'none'
+    CHECK(acceptance_phase IN ('none', 'accepted', 'applying', 'published')),
+  source_apply_intent TEXT NOT NULL DEFAULT 'not-requested'
+    CHECK(source_apply_intent IN ('requested', 'not-requested')),
+  source_apply_outcome TEXT NOT NULL DEFAULT ''
+    CHECK(source_apply_outcome IN ('', 'applied', 'skipped', 'not-requested')),
+  source_apply_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -108,7 +123,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
 
 # Schema v1 was the original unversioned durable store. v2 added dossiers. v3
-# makes dossier publication explicit and makes attempt ownership relational.
+# made dossier publication explicit and attempt ownership relational. v4 adds a
+# durable acceptance/apply journal so Git source application can be reconciled
+# after a hard crash rather than pretending Git and SQLite share one transaction.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
         """
@@ -122,8 +139,6 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
     ),
     2: (
-        # Very early legacy fixtures contained only jobs. Materialize the v2
-        # parent tables first so the v2 -> v3 migration remains deterministic.
         """
         CREATE TABLE IF NOT EXISTS tasks (
           id TEXT PRIMARY KEY,
@@ -207,70 +222,40 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE attempts_v3 RENAME TO attempts",
         "CREATE INDEX IF NOT EXISTS idx_attempts_job_task ON attempts(job_id, task_id, number DESC)",
     ),
-}
-
-_EXPECTED_COLUMNS: dict[str, tuple[str, ...]] = {
-    "jobs": (
-        "id",
-        "repo",
-        "goal",
-        "state",
-        "base_branch",
-        "base_commit",
-        "integration_branch",
-        "integration_path",
-        "auto_apply",
-        "stop_requested",
-        "final_summary",
-        "error",
-        "created_at",
-        "updated_at",
+    3: (
+        "ALTER TABLE jobs ADD COLUMN accepted_commit TEXT NOT NULL DEFAULT ''",
+        """
+        ALTER TABLE jobs ADD COLUMN acceptance_phase TEXT NOT NULL DEFAULT 'none'
+          CHECK(acceptance_phase IN ('none', 'accepted', 'applying', 'published'))
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN source_apply_intent TEXT NOT NULL DEFAULT 'not-requested'
+          CHECK(source_apply_intent IN ('requested', 'not-requested'))
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN source_apply_outcome TEXT NOT NULL DEFAULT ''
+          CHECK(source_apply_outcome IN ('', 'applied', 'skipped', 'not-requested'))
+        """,
+        "ALTER TABLE jobs ADD COLUMN source_apply_reason TEXT NOT NULL DEFAULT ''",
+        """
+        UPDATE jobs
+        SET acceptance_phase = 'published',
+            source_apply_intent = CASE WHEN auto_apply = 1 THEN 'requested' ELSE 'not-requested' END,
+            source_apply_outcome = CASE
+              WHEN EXISTS(
+                SELECT 1 FROM events
+                WHERE events.job_id = jobs.id AND events.kind = 'job.applied'
+              ) THEN 'applied'
+              WHEN EXISTS(
+                SELECT 1 FROM events
+                WHERE events.job_id = jobs.id AND events.kind = 'job.apply_skipped'
+              ) THEN 'skipped'
+              WHEN auto_apply = 0 THEN 'not-requested'
+              ELSE ''
+            END
+        WHERE state = 'completed'
+        """,
     ),
-    "tasks": (
-        "id",
-        "job_id",
-        "seq",
-        "logical_id",
-        "title",
-        "description",
-        "state",
-        "dependencies",
-        "acceptance",
-        "preferred_agent",
-        "attempts",
-        "branch",
-        "worktree",
-        "base_commit",
-        "last_error",
-        "result_summary",
-        "created_at",
-        "updated_at",
-    ),
-    "attempts": (
-        "id",
-        "job_id",
-        "task_id",
-        "number",
-        "agent",
-        "state",
-        "worktree",
-        "branch",
-        "log_path",
-        "started_at",
-        "finished_at",
-        "returncode",
-        "summary",
-    ),
-    "events": ("id", "job_id", "task_id", "kind", "payload", "created_at"),
-    "dossiers": ("job_id", "schema_version", "sha256", "content", "published", "created_at"),
-}
-
-_EXPECTED_INDEXES: dict[str, tuple[str, tuple[str, ...], bool]] = {
-    "idx_tasks_job_state": ("tasks", ("job_id", "state"), False),
-    "idx_tasks_job_id_id": ("tasks", ("job_id", "id"), True),
-    "idx_attempts_job_task": ("attempts", ("job_id", "task_id", "number"), False),
-    "idx_events_job_id": ("events", ("job_id", "id"), False),
-    "idx_jobs_created": ("jobs", ("created_at",), False),
 }
 
 MAX_JOB_LIST_LIMIT = 200
@@ -314,10 +299,8 @@ class DatabaseCore:
                         self.last_migration_backup = self._backup_before_migration(version)
                         self._migrate(version)
                     else:
-                        # A database already claiming the current schema must first
-                        # prove its table/column contract. Do not let CREATE INDEX or
-                        # other idempotent DDL obscure structural corruption with a
-                        # secondary "no such column" error.
+                        # A current-version database must prove its structural
+                        # contract before any idempotent CREATE INDEX can repair it.
                         self._validate_table_columns_contract()
                     self._conn.executescript(SCHEMA)
                     self._set_schema_version(CURRENT_SCHEMA_VERSION)
@@ -397,35 +380,13 @@ class DatabaseCore:
         self._validate_schema_contract()
 
     def _validate_table_columns_contract(self) -> None:
-        for table, expected in _EXPECTED_COLUMNS.items():
-            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
-            actual = tuple(str(row["name"]) for row in rows)
-            # SQLite ALTER TABLE appends columns, so a valid migrated schema can
-            # have a different physical column order than a fresh database. All
-            # production writes name columns explicitly; membership is the trust
-            # invariant, not ordinal position.
-            if len(actual) != len(expected) or set(actual) != set(expected):
-                raise sqlite3.DatabaseError(
-                    f"schema contract mismatch for {table}: expected columns {expected}, got {actual}"
-                )
+        validate_table_columns(self._conn)
 
     def _validate_schema_contract(self) -> None:
-        self._validate_table_columns_contract()
-
-        for name, (table, expected_columns, expected_unique) in _EXPECTED_INDEXES.items():
-            index_rows = self._conn.execute(f"PRAGMA index_list({table})").fetchall()
-            match = next((row for row in index_rows if str(row["name"]) == name), None)
-            if match is None:
-                raise sqlite3.DatabaseError(f"schema contract missing index {name}")
-            actual_unique = bool(match["unique"])
-            columns = tuple(
-                str(row["name"])
-                for row in self._conn.execute(f"PRAGMA index_info({name})").fetchall()
-            )
-            if columns != expected_columns or actual_unique != expected_unique:
-                raise sqlite3.DatabaseError(
-                    f"schema contract mismatch for index {name}: columns={columns}, unique={actual_unique}"
-                )
+        validate_table_columns(self._conn)
+        validate_named_indexes(self._conn)
+        validate_unique_constraints(self._conn)
+        validate_check_constraints(self._conn)
 
         task_fks = self._foreign_key_signatures("tasks")
         if ("jobs", "CASCADE", (("job_id", "id"),)) not in task_fks:
@@ -470,6 +431,49 @@ class DatabaseCore:
             )
         return signatures
 
+    def _snapshot_locked(
+        self, job_id: str
+    ) -> tuple[JobState, tuple[TaskState, ...], tuple[TaskState, ...], bool, str]:
+        job = self._conn.execute(
+            "SELECT state, stop_requested, acceptance_phase FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            raise KeyError(job_id)
+        task_rows = self._conn.execute(
+            "SELECT id, state FROM tasks WHERE job_id = ? ORDER BY seq",
+            (job_id,),
+        ).fetchall()
+        running_attempt_rows = self._conn.execute(
+            """
+            SELECT t.state AS task_state
+            FROM attempts AS a
+            JOIN tasks AS t ON t.job_id = a.job_id AND t.id = a.task_id
+            WHERE a.job_id = ? AND a.state = 'running'
+            ORDER BY a.started_at, a.id
+            """,
+            (job_id,),
+        ).fetchall()
+        return (
+            JobState(str(job["state"])),
+            tuple(TaskState(str(row["state"])) for row in task_rows),
+            tuple(TaskState(str(row["task_state"])) for row in running_attempt_rows),
+            bool(job["stop_requested"]),
+            str(job["acceptance_phase"]),
+        )
+
+    def _validate_snapshot_locked(self, job_id: str) -> None:
+        state, tasks, running_owners, stop_requested, acceptance_phase = self._snapshot_locked(
+            job_id
+        )
+        validate_job_snapshot(
+            state,
+            tasks,
+            stop_requested=stop_requested,
+            running_attempt_task_states=running_owners,
+            acceptance_phase=acceptance_phase,
+        )
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -503,6 +507,11 @@ class DatabaseCore:
             updated_at=float(row["updated_at"]),
             final_summary=str(row["final_summary"]),
             error=str(row["error"]),
+            accepted_commit=str(row["accepted_commit"]),
+            acceptance_phase=str(row["acceptance_phase"]),
+            source_apply_intent=str(row["source_apply_intent"]),
+            source_apply_outcome=str(row["source_apply_outcome"]),
+            source_apply_reason=str(row["source_apply_reason"]),
         )
 
     @staticmethod
