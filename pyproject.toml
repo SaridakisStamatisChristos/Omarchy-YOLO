@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omarchy-yolo"
-version = "1.4.0"
+version = "1.4.1"
 description = "Persistent, multi-agent YOLO orchestration for Omarchy Quattro"
 readme = "README.md"
 requires-python = ">=3.12"
