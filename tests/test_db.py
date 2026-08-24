@@ -75,7 +75,7 @@ def test_recovery_preserves_explicit_stop(tmp_path: Path) -> None:
         auto_apply=False,
     )
     task = db.add_tasks(job.id, [PlannedTask("T1", "Title", "Description")])[0]
-    db.update_job(job.id, state=JobState.STOPPING, stop_requested=True)
+    db.update_job(job.id, state=JobState.RUNNING)
     db.update_task(task.id, state=TaskState.RUNNING, attempts=1)
     attempt_id = db.start_attempt(
         job_id=job.id,
@@ -86,6 +86,7 @@ def test_recovery_preserves_explicit_stop(tmp_path: Path) -> None:
         branch="yolo/t1",
         log_path="/tmp/a.log",
     )
+    db.update_job(job.id, state=JobState.STOPPING, stop_requested=True)
 
     assert db.recover_incomplete() == []
     recovered = db.get_job(job.id)
@@ -111,20 +112,21 @@ def test_prepare_resume_closes_stale_attempt_and_preserves_attempt_number(tmp_pa
     db.update_job(job.id, state=JobState.FAILED, error="boom")
 
     # Recovery tests intentionally emulate a stale pre-v1.4.1 durable snapshot.
-    # The guarded public mutation API must reject FAILED + in-flight task, so seed
-    # that historical state directly and verify prepare_resume repairs it atomically.
+    # The guarded public mutation API must reject FAILED + in-flight state, so seed
+    # that historical graph directly and verify prepare_resume repairs it atomically.
     db._execute(
         "UPDATE tasks SET state = ?, attempts = ?, last_error = ? WHERE id = ?",
         (TaskState.REVIEWING.value, 3, "useful context", task.id),
     )
-    attempt_id = db.start_attempt(
-        job_id=job.id,
-        task_id=task.id,
-        number=3,
-        agent="fake",
-        worktree="/tmp/wt",
-        branch="yolo/t1",
-        log_path="/tmp/a.log",
+    attempt_id = "attempt_stale_resume"
+    db._execute(
+        """
+        INSERT INTO attempts(
+          id, job_id, task_id, number, agent, state, worktree, branch,
+          log_path, started_at
+        ) VALUES (?, ?, ?, 3, 'fake', 'running', '/tmp/wt', 'yolo/t1', '/tmp/a.log', 0)
+        """,
+        (attempt_id, job.id, task.id),
     )
 
     db.prepare_resume(job.id)
