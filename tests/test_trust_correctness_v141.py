@@ -197,7 +197,7 @@ def test_completed_job_is_absorbing_across_resume_boundary(tmp_path: Path) -> No
             final_summary="accepted",
             source_apply_outcome="not-requested",
         )
-        with pytest.raises(StateTransitionError, match="stopped or failed"):
+        with pytest.raises(StateTransitionError, match="acceptance begins"):
             db.prepare_resume(job_id)
         assert db.get_job(job_id).state == JobState.COMPLETED
         assert db.get_dossier(job_id) is not None
