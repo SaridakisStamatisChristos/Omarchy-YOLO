@@ -258,6 +258,9 @@ async def cmd_doctor(_: argparse.Namespace) -> int:
     checks.append(("state", True, str(cfg.state_dir)))
     if cfg.sandbox.backend == "bwrap":
         checks.append(("bubblewrap", shutil.which("bwrap") is not None, shutil.which("bwrap") or "missing"))
+    if cfg.resources.enabled:
+        resource_ok, resource_detail = await asyncio.to_thread(cfg.resources.probe)
+        checks.append(("resources", resource_ok, resource_detail))
     checks.append(("omarchy-shell", shutil.which("omarchy-shell") is not None, shutil.which("omarchy-shell") or "not on PATH"))
     plugin = Path.home() / ".config/omarchy/plugins/dev.aether.yolo/manifest.json"
     checks.append(("shell-plugin", plugin.exists(), str(plugin)))
@@ -304,7 +307,7 @@ async def cmd_doctor(_: argparse.Namespace) -> int:
         marker = "OK" if ok else "!!"
         print(f"[{marker}] {name:<16} {terminal_safe(detail, single_line=True)}")
         if (
-            name in {"python", "linux", "non-root", "git", "agent-ready"}
+            name in {"python", "linux", "non-root", "git", "agent-ready", "resources"}
             or name.startswith("role:")
         ) and not ok:
             ready = False
