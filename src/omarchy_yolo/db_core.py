@@ -180,6 +180,19 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
           UNIQUE(task_id, number)
         )
         """,
+        # Some v1 fixtures predate the event ledger entirely. v4 migration reads
+        # completion/apply events, so materialize the canonical ledger before the
+        # v3 -> v4 journal backfill rather than assuming a later SCHEMA pass did it.
+        """
+        CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          task_id TEXT,
+          kind TEXT NOT NULL,
+          payload TEXT NOT NULL DEFAULT '{}',
+          created_at REAL NOT NULL
+        )
+        """,
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_job_id_id ON tasks(job_id, id)",
         "ALTER TABLE dossiers ADD COLUMN published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0, 1))",
         """
