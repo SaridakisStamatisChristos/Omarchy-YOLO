@@ -17,6 +17,11 @@ from .util import YoloError, truncate_utf8
 DOSSIER_SCHEMA_VERSION = 1
 MAX_DOSSIER_BYTES = 512_000
 _DOSSIER_BOUNDARY_EVENT = "job.dossier_created"
+# v1.4.2 journals acceptance before external source application. That journal
+# event is emitted after the dossier input has already been frozen, so it must
+# also terminate deterministic event-prefix regeneration. Keep the serialized
+# boundary_event field stable for v1.4.x dossier compatibility.
+_DOSSIER_INPUT_STOP_EVENTS = frozenset({"job.accepted", _DOSSIER_BOUNDARY_EVENT})
 
 
 def canonical_json(value: object) -> str:
@@ -37,10 +42,13 @@ def verify_dossier(content: str, expected_sha256: str) -> bool:
 
 
 def _event_digest(events: list[dict[str, Any]]) -> tuple[str, dict[str, int], int, int]:
-    """Hash the durable event prefix immediately preceding dossier publication.
+    """Hash only events that existed when the dossier input was frozen.
 
-    Once a prior dossier boundary exists, later completion/cleanup events are outside
-    the accepted-input prefix and must not perturb deterministic regeneration.
+    v1.4.1's first publication-side event was ``job.dossier_created``. v1.4.2
+    durably journals ``job.accepted`` earlier so source application can recover
+    after a hard crash. Both are publication machinery, not dossier inputs, and
+    therefore terminate the deterministic prefix. This also preserves stable
+    regeneration for older ledgers that have no ``job.accepted`` event.
     """
 
     digest = hashlib.sha256()
@@ -49,7 +57,7 @@ def _event_digest(events: list[dict[str, Any]]) -> tuple[str, dict[str, int], in
     last_event_id = 0
     for event in events:
         kind = str(event["kind"])
-        if kind == _DOSSIER_BOUNDARY_EVENT:
+        if kind in _DOSSIER_INPUT_STOP_EVENTS:
             break
         kinds[kind] += 1
         digest.update(canonical_json(event).encode("utf-8"))
