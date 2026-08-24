@@ -40,7 +40,7 @@ jobs:
         run: |
           python -m venv /tmp/omarchy-yolo-wheel
           /tmp/omarchy-yolo-wheel/bin/python -m pip install --no-deps dist/omarchy_yolo-*.whl
-          /tmp/omarchy-yolo-wheel/bin/python -c 'import omarchy_yolo; assert omarchy_yolo.__version__ == "1.4.0"'
+          /tmp/omarchy-yolo-wheel/bin/python -c 'import omarchy_yolo; assert omarchy_yolo.__version__ == "1.4.1"'
           /tmp/omarchy-yolo-wheel/bin/yolo --version
           /tmp/omarchy-yolo-wheel/bin/python -m omarchy_yolo --version
           /tmp/omarchy-yolo-wheel/bin/yolo-dossier --help >/dev/null
