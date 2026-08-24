@@ -68,7 +68,13 @@ def _summary_fingerprint(value: str) -> dict[str, object]:
 
 
 def _effective_config(config: Config) -> dict[str, object]:
+    posture, posture_detail = config.trust_posture()
     return {
+        "safety": {
+            "preset": config.safety_preset,
+            "effective_posture": posture,
+            "detail": posture_detail,
+        },
         "engine": {
             "max_parallel": config.engine.max_parallel,
             "max_global_workers": config.engine.max_global_workers,
@@ -85,7 +91,6 @@ def _effective_config(config: Config) -> dict[str, object]:
             "cleanup_worktrees": config.engine.cleanup_worktrees,
             "execution_profile": config.engine.execution_profile,
             "final_review_chunk_bytes": config.engine.final_review_chunk_bytes,
-            "final_review_chunk_files": config.engine.final_review_chunk_files,
             "final_review_max_files": config.engine.final_review_max_files,
             "final_review_allow_binary": config.engine.final_review_allow_binary,
         },
@@ -102,6 +107,8 @@ def _effective_config(config: Config) -> dict[str, object]:
         "sandbox": {
             "backend": config.sandbox.backend,
             "network": config.sandbox.network,
+            "review_network": config.sandbox.review_network,
+            "gate_network": config.sandbox.gate_network,
             "read_only_home": config.sandbox.read_only_home,
             "writable_home_paths": list(config.sandbox.writable_home_paths),
             "hostile_repo_mode": config.sandbox.hostile_repo_mode,
