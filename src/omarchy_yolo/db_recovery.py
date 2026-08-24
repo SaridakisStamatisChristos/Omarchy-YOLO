@@ -197,13 +197,15 @@ class RecoveryMixin(DatabaseCore):
             for row in active_rows:
                 validate_job_transition(JobState(str(row["state"])), JobState.QUEUED)
             for row in stopped_rows:
+                # Recovery may observe either half of a stop request: the durable
+                # boolean may be set before the state reaches STOPPING, or STOPPING
+                # may have been committed just before interruption. Model every
+                # such case through the explicit STOPPING state, then settle it to
+                # STOPPED inside one recovery transaction.
                 source = JobState(str(row["state"]))
-                if source != JobState.STOPPING or not bool(row["stop_requested"]):
-                    raise StateTransitionError(
-                        f"invalid stopped-recovery origin for {row['id']}: "
-                        f"state={source.value} stop_requested={bool(row['stop_requested'])}"
-                    )
-                validate_job_transition(source, JobState.STOPPED)
+                if source != JobState.STOPPING:
+                    validate_job_transition(source, JobState.STOPPING)
+                validate_job_transition(JobState.STOPPING, JobState.STOPPED)
 
             self._conn.execute("BEGIN IMMEDIATE")
             try:
