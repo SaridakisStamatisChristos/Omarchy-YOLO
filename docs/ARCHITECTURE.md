@@ -1,5 +1,7 @@
 # Architecture
 
+For a complete end-to-end walkthrough of one autonomous job—from submission through planning, isolated execution, verification, integration, final review, provenance, recovery, and optional source application—see [HOW_IT_WORKS.md](HOW_IT_WORKS.md). This document focuses on implementation structure, invariants, and trust boundaries.
+
 ```text
                               user / Quickshell
                                      |

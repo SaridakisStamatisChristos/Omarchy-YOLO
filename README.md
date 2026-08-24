@@ -11,6 +11,8 @@ The normal mode is intentionally unattended. The source checkout is protected by
 in separate worktrees and the integration branch is separate from your current branch. Automatic fast-forward
 of the source branch is opt-in and is refused if the source branch has moved or become dirty.
 
+> **New to Omarchy YOLO?** Read [How Omarchy YOLO Works](docs/HOW_IT_WORKS.md) for the complete step-by-step lifecycle from goal submission through planning, isolated execution, verification, integration, final audit, provenance, and optional source application.
+
 > **YOLO does not mean root.** The daemon refuses to run as root. Unattended coding agents are powerful and
 > can execute commands as your user. Read [SECURITY.md](SECURITY.md) before pointing this at untrusted code.
 
