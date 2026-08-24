@@ -16,6 +16,14 @@ of the source branch is opt-in and is refused if the source branch has moved or 
 > **YOLO does not mean root.** The daemon refuses to run as root. Unattended coding agents are powerful and
 > can execute commands as your user. Read [SECURITY.md](SECURITY.md) before pointing this at untrusted code.
 
+## Documentation
+
+- [How Omarchy YOLO Works](docs/HOW_IT_WORKS.md) — end-to-end lifecycle and mental model.
+- [Operator Guide](docs/OPERATOR_GUIDE.md) — installation verification, running jobs, stop/resume, logs/events, dossiers, recovery and troubleshooting.
+- [Configuration Reference](docs/CONFIGURATION.md) — every supported configuration field, validation range, interaction and recommended profile.
+- [Architecture](docs/ARCHITECTURE.md) — implementation structure, invariants, recovery and review architecture.
+- [Security](SECURITY.md) — trust boundaries, hostile-repository policy and isolation limitations.
+
 ## Architecture
 
 ```text
@@ -214,7 +222,7 @@ agent CLI.
 
 ## Configuration
 
-Copy/edit `config.example.toml` or the installer-created `~/.config/omarchy-yolo/config.toml`.
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete reference. Copy/edit `config.example.toml` or the installer-created `~/.config/omarchy-yolo/config.toml`.
 
 ```toml
 [engine]
