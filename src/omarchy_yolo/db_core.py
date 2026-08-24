@@ -313,6 +313,12 @@ class DatabaseCore:
                     if version < CURRENT_SCHEMA_VERSION:
                         self.last_migration_backup = self._backup_before_migration(version)
                         self._migrate(version)
+                    else:
+                        # A database already claiming the current schema must first
+                        # prove its table/column contract. Do not let CREATE INDEX or
+                        # other idempotent DDL obscure structural corruption with a
+                        # secondary "no such column" error.
+                        self._validate_table_columns_contract()
                     self._conn.executescript(SCHEMA)
                     self._set_schema_version(CURRENT_SCHEMA_VERSION)
                 self._validate_integrity_and_schema()
@@ -390,14 +396,21 @@ class DatabaseCore:
             raise sqlite3.DatabaseError("foreign_key_check found relational violations")
         self._validate_schema_contract()
 
-    def _validate_schema_contract(self) -> None:
+    def _validate_table_columns_contract(self) -> None:
         for table, expected in _EXPECTED_COLUMNS.items():
             rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
             actual = tuple(str(row["name"]) for row in rows)
-            if actual != expected:
+            # SQLite ALTER TABLE appends columns, so a valid migrated schema can
+            # have a different physical column order than a fresh database. All
+            # production writes name columns explicitly; membership is the trust
+            # invariant, not ordinal position.
+            if len(actual) != len(expected) or set(actual) != set(expected):
                 raise sqlite3.DatabaseError(
                     f"schema contract mismatch for {table}: expected columns {expected}, got {actual}"
                 )
+
+    def _validate_schema_contract(self) -> None:
+        self._validate_table_columns_contract()
 
         for name, (table, expected_columns, expected_unique) in _EXPECTED_INDEXES.items():
             index_rows = self._conn.execute(f"PRAGMA index_list({table})").fetchall()
