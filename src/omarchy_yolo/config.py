@@ -343,15 +343,17 @@ def load_config(path: Path | None = None) -> Config:
     s = _section(data, "sandbox")
     hostile_preset = safety_preset == "hostile-repo"
     if hostile_preset:
-        contradictions = {
-            "backend": lambda value: str(value) != "bwrap",
-            "hostile_repo_mode": lambda value: value is not True,
-            "read_only_home": lambda value: value is not True,
-            "review_network": lambda value: value is not False,
-            "gate_network": lambda value: value is not False,
-        }
-        for key, invalid in contradictions.items():
-            if key in s and invalid(s[key]):
+        if "backend" in s and str(s["backend"]) != "bwrap":
+            raise YoloError(
+                "safety.preset='hostile-repo' conflicts with sandbox.backend"
+            )
+        for key in ("hostile_repo_mode", "read_only_home"):
+            if key in s and s[key] is not True:
+                raise YoloError(
+                    f"safety.preset='hostile-repo' conflicts with sandbox.{key}"
+                )
+        for key in ("review_network", "gate_network"):
+            if key in s and s[key] is not False:
                 raise YoloError(
                     f"safety.preset='hostile-repo' conflicts with sandbox.{key}"
                 )
