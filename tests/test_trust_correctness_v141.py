@@ -52,12 +52,32 @@ def _stage(db: Database, job_id: str, content: str = '{"accepted":true}') -> str
     return digest
 
 
+def _prepare(
+    db: Database,
+    job_id: str,
+    *,
+    content: str,
+    digest: str,
+    final_summary: str,
+) -> None:
+    db.prepare_accepted_job(
+        job_id,
+        accepted_commit="b" * 40,
+        final_summary=final_summary,
+        source_apply_intent="not-requested",
+        dossier_schema_version=1,
+        dossier_sha256=digest,
+        dossier_content=content,
+    )
+
+
 def test_staged_dossier_is_invisible_until_atomic_completion(tmp_path: Path) -> None:
     db = Database(tmp_path / "state" / "state.sqlite3")
     try:
         job_id, task_id = _running_job_with_task(db, tmp_path)
         _complete_task(db, task_id)
-        digest = _stage(db, job_id)
+        content = '{"accepted":true}'
+        digest = _stage(db, job_id, content)
 
         staged = db.get_staged_dossier(job_id)
         assert staged is not None
@@ -66,6 +86,13 @@ def test_staged_dossier_is_invisible_until_atomic_completion(tmp_path: Path) -> 
         assert db.get_dossier(job_id) is None
         assert db.get_job(job_id).state == JobState.RUNNING
 
+        _prepare(
+            db,
+            job_id,
+            content=content,
+            digest=digest,
+            final_summary="release accepted",
+        )
         db.publish_completed_job(
             job_id,
             dossier_schema_version=1,
@@ -76,12 +103,14 @@ def test_staged_dossier_is_invisible_until_atomic_completion(tmp_path: Path) -> 
 
         job = db.get_job(job_id)
         assert job.state == JobState.COMPLETED
+        assert job.acceptance_phase == "published"
+        assert job.accepted_commit == "b" * 40
         assert not job.stop_requested
         published = db.get_dossier(job_id)
         assert published is not None
         assert published["sha256"] == digest
         kinds = [event["kind"] for event in db.events(job_id, limit=100)]
-        assert kinds[-2:] == ["job.dossier_created", "job.completed"]
+        assert kinds[-3:] == ["job.accepted", "job.dossier_created", "job.completed"]
     finally:
         db.close()
 
@@ -122,16 +151,18 @@ def test_completion_requires_publication_and_complete_cross_record_snapshot(
             db.update_job(job_id, state=JobState.COMPLETED)
         assert db.get_job(job_id).state == JobState.RUNNING
 
-        digest = _stage(db, job_id)
+        content = '{"accepted":true}'
+        digest = _stage(db, job_id, content)
         with pytest.raises(StateTransitionError, match="non-completed"):
-            db.publish_completed_job(
+            _prepare(
+                db,
                 job_id,
-                dossier_schema_version=1,
-                dossier_sha256=digest,
+                content=content,
+                digest=digest,
                 final_summary="not accepted",
-                source_apply_outcome="not-requested",
             )
         assert db.get_job(job_id).state == JobState.RUNNING
+        assert db.get_job(job_id).acceptance_phase == "none"
         assert db.get_task(task_id).state == TaskState.PENDING
         assert db.get_dossier(job_id) is None
     finally:
@@ -156,7 +187,9 @@ def test_completed_job_is_absorbing_across_resume_boundary(tmp_path: Path) -> No
     try:
         job_id, task_id = _running_job_with_task(db, tmp_path)
         _complete_task(db, task_id)
-        digest = _stage(db, job_id)
+        content = '{"accepted":true}'
+        digest = _stage(db, job_id, content)
+        _prepare(db, job_id, content=content, digest=digest, final_summary="accepted")
         db.publish_completed_job(
             job_id,
             dossier_schema_version=1,
@@ -175,8 +208,10 @@ def test_completed_job_is_absorbing_across_resume_boundary(tmp_path: Path) -> No
 def test_attempt_must_reference_task_owned_by_same_job(tmp_path: Path) -> None:
     db = Database(tmp_path / "state" / "state.sqlite3")
     try:
-        job_a, _ = _running_job_with_task(db, tmp_path, suffix="a")
+        job_a, task_a = _running_job_with_task(db, tmp_path, suffix="a")
         _job_b, task_b = _running_job_with_task(db, tmp_path, suffix="b")
+        db.update_task(task_a, state=TaskState.RUNNING)
+        db.update_task(task_b, state=TaskState.RUNNING)
         with pytest.raises(YoloError, match="ownership mismatch"):
             db.start_attempt(
                 job_id=job_a,
@@ -244,6 +279,7 @@ def test_dossier_cli_refuses_staged_state_then_verifies_published_state(
         _complete_task(db, task_id)
         content = '{"release":"accepted"}'
         digest = _stage(db, job_id, content)
+        _prepare(db, job_id, content=content, digest=digest, final_summary="accepted")
     finally:
         db.close()
 
