@@ -121,6 +121,11 @@ class JobRecord:
     updated_at: float
     final_summary: str = ""
     error: str = ""
+    accepted_commit: str = ""
+    acceptance_phase: str = "none"
+    source_apply_intent: str = "not-requested"
+    source_apply_outcome: str = ""
+    source_apply_reason: str = ""
 
 
 @dataclass(slots=True)
