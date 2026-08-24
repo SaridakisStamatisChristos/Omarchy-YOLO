@@ -63,8 +63,13 @@ class SandboxConfig:
     def network_for(self, execution_profile: str) -> bool:
         if execution_profile == "review" and self.review_network is not None:
             return self.review_network
-        if execution_profile == "gate" and self.gate_network is not None:
-            return self.gate_network
+        if execution_profile == "gate":
+            if self.gate_network is not None:
+                return self.gate_network
+            # Preserve the v1.3 hostile-repository invariant even when callers
+            # construct SandboxConfig directly instead of selecting a named preset.
+            if self.hostile_repo_mode:
+                return False
         return self.network
 
 
