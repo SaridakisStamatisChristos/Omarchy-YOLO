@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from .db_core import DatabaseCore
 from .model import JobState, TaskState
+from .state_machine import StateTransitionError, validate_job_snapshot, validate_job_transition
 
 if TYPE_CHECKING:
     from .model import JobRecord
@@ -23,16 +24,44 @@ class RecoveryMixin(DatabaseCore):
             task_id: str | None = None,
         ) -> int: ...
 
+    def _validate_snapshot_locked(self, job_id: str) -> None:
+        job = self._conn.execute(
+            "SELECT state, stop_requested FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if job is None:
+            raise KeyError(job_id)
+        tasks = self._conn.execute(
+            "SELECT state FROM tasks WHERE job_id = ? ORDER BY seq", (job_id,)
+        ).fetchall()
+        validate_job_snapshot(
+            JobState(str(job["state"])),
+            (TaskState(str(row["state"])) for row in tasks),
+            stop_requested=bool(job["stop_requested"]),
+        )
+
     def retry_failed_tasks(self, job_id: str) -> None:
         """Compatibility helper: make all non-completed task states schedulable again."""
+        job = self.get_job(job_id)
+        if job.state not in {JobState.FAILED, JobState.STOPPED, JobState.QUEUED}:
+            raise StateTransitionError(
+                f"cannot retry tasks while job is {job.state.value}"
+            )
         now = utc_ts()
-        self._execute(
-            """
-            UPDATE tasks SET state = ?, updated_at = ?
-            WHERE job_id = ? AND state != ?
-            """,
-            (TaskState.PENDING.value, now, job_id, TaskState.COMPLETED.value),
-        )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    UPDATE tasks SET state = ?, updated_at = ?
+                    WHERE job_id = ? AND state != ?
+                    """,
+                    (TaskState.PENDING.value, now, job_id, TaskState.COMPLETED.value),
+                )
+                self._validate_snapshot_locked(job_id)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def settle_inflight(
         self,
@@ -52,6 +81,10 @@ class RecoveryMixin(DatabaseCore):
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if self._conn.execute(
+                    "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone() is None:
+                    raise KeyError(job_id)
                 self._conn.execute(
                     """
                     UPDATE attempts
@@ -80,18 +113,29 @@ class RecoveryMixin(DatabaseCore):
                         TaskState.INTEGRATING.value,
                     ),
                 )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
 
     def prepare_resume(self, job_id: str) -> None:
-        """Atomically close stale attempts and make a stopped/failed job schedulable."""
-        self.get_job(job_id)
+        """Atomically resume only a durably stopped or failed job."""
         now = utc_ts()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                row = self._conn.execute(
+                    "SELECT state FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(job_id)
+                current = JobState(str(row["state"]))
+                if current not in {JobState.STOPPED, JobState.FAILED}:
+                    raise StateTransitionError(
+                        f"resume requires stopped or failed job, got {current.value}"
+                    )
+                validate_job_transition(current, JobState.QUEUED)
                 self._conn.execute(
                     """
                     UPDATE attempts
@@ -111,13 +155,19 @@ class RecoveryMixin(DatabaseCore):
                     """,
                     (TaskState.PENDING.value, now, job_id, TaskState.COMPLETED.value),
                 )
-                self._conn.execute(
+                cur = self._conn.execute(
                     """
-                    UPDATE jobs SET state = ?, stop_requested = 0, error = '', updated_at = ?
-                    WHERE id = ?
+                    UPDATE jobs
+                    SET state = ?, stop_requested = 0, error = '', updated_at = ?
+                    WHERE id = ? AND state = ?
                     """,
-                    (JobState.QUEUED.value, now, job_id),
+                    (JobState.QUEUED.value, now, job_id, current.value),
                 )
+                if cur.rowcount != 1:
+                    raise StateTransitionError(
+                        f"stale job state while resuming {job_id}"
+                    )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -131,14 +181,31 @@ class RecoveryMixin(DatabaseCore):
             rows = self._conn.execute(
                 "SELECT id, state, stop_requested FROM jobs WHERE state NOT IN (?, ?, ?)", terminal
             ).fetchall()
-            active_ids = [
-                str(row["id"])
-                for row in rows
-                if not bool(row["stop_requested"]) and str(row["state"]) != JobState.STOPPING.value
-            ]
-            stopped_ids = [str(row["id"]) for row in rows if str(row["id"]) not in active_ids]
             if not rows:
                 return []
+
+            active_rows = [
+                row
+                for row in rows
+                if not bool(row["stop_requested"])
+                and str(row["state"]) != JobState.STOPPING.value
+            ]
+            stopped_rows = [row for row in rows if row not in active_rows]
+            active_ids = [str(row["id"]) for row in active_rows]
+            stopped_ids = [str(row["id"]) for row in stopped_rows]
+
+            for row in active_rows:
+                validate_job_transition(JobState(str(row["state"])), JobState.QUEUED)
+            for row in stopped_rows:
+                # Recovery may observe either half of a stop request: the durable
+                # boolean may be set before the state reaches STOPPING, or STOPPING
+                # may have been committed just before interruption. Model every
+                # such case through the explicit STOPPING state, then settle it to
+                # STOPPED inside one recovery transaction.
+                source = JobState(str(row["state"]))
+                if source != JobState.STOPPING:
+                    validate_job_transition(source, JobState.STOPPING)
+                validate_job_transition(JobState.STOPPING, JobState.STOPPED)
 
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -212,6 +279,9 @@ class RecoveryMixin(DatabaseCore):
                         f"WHERE id IN ({placeholders})",
                         (JobState.STOPPED.value, now, *stopped_ids),
                     )
+
+                for job_id in (*active_ids, *stopped_ids):
+                    self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")

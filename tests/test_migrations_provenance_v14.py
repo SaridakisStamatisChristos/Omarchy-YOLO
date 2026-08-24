@@ -61,6 +61,11 @@ def test_legacy_database_migrates_with_private_backup(tmp_path: Path) -> None:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dossiers'"
         ).fetchone()
         assert row is not None
+        columns = {
+            str(row["name"])
+            for row in db._execute("PRAGMA table_info(dossiers)").fetchall()
+        }
+        assert "published" in columns
     finally:
         db.close()
 
@@ -145,15 +150,23 @@ def test_dossier_is_deterministic_verifiable_and_boundary_stable(tmp_path: Path)
         assert payload["job"]["source_apply_intent"] == "not-requested"
         assert payload["event_ledger"]["count"] >= 2
 
-        db.store_dossier(
+        db.stage_dossier(
             job.id,
             schema_version=DOSSIER_SCHEMA_VERSION,
             sha256=first_hash,
             content=first_content,
         )
-        db.event(job.id, "job.dossier_created", {"sha256": first_hash})
-        db.update_job(job.id, state=JobState.COMPLETED)
-        db.event(job.id, "job.completed", {"dossier_sha256": first_hash})
+        assert db.get_dossier(job.id) is None
+        staged = db.get_staged_dossier(job.id)
+        assert staged is not None and staged["published"] is False
+
+        db.publish_completed_job(
+            job.id,
+            dossier_schema_version=DOSSIER_SCHEMA_VERSION,
+            dossier_sha256=first_hash,
+            final_summary="release accepted",
+            source_apply_outcome="not-requested",
+        )
         db.event(job.id, "job.cleanup_failed", {"synthetic": True})
 
         regenerated, regenerated_hash = build_dossier(

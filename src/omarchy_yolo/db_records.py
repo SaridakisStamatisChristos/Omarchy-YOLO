@@ -72,31 +72,6 @@ class RecordsMixin(DatabaseCore):
         )
         return [self._job_from_row(row) for row in rows]
 
-    def update_job(self, job_id: str, **fields: Any) -> None:
-        allowed = {
-            "state",
-            "integration_path",
-            "stop_requested",
-            "final_summary",
-            "error",
-            "auto_apply",
-        }
-        unknown = set(fields) - allowed
-        if unknown:
-            raise ValueError(f"unsupported job fields: {sorted(unknown)}")
-        if not fields:
-            return
-        values: dict[str, Any] = dict(fields)
-        if isinstance(values.get("state"), JobState):
-            values["state"] = values["state"].value
-        for key in ("stop_requested", "auto_apply"):
-            if key in values:
-                values[key] = int(bool(values[key]))
-        values["updated_at"] = utc_ts()
-        assignments = ", ".join(f"{key} = ?" for key in values)
-        params = (*values.values(), job_id)
-        self._execute(f"UPDATE jobs SET {assignments} WHERE id = ?", params)
-
     def add_tasks(self, job_id: str, planned: Iterable[PlannedTask]) -> list[TaskRecord]:
         now = utc_ts()
         rows: list[tuple[Any, ...]] = []
@@ -154,69 +129,6 @@ class RecordsMixin(DatabaseCore):
         if row is None:
             raise KeyError((job_id, logical_id))
         return self._task_from_row(row)
-
-    def update_task(self, task_id: str, **fields: Any) -> None:
-        allowed = {
-            "state",
-            "attempts",
-            "branch",
-            "worktree",
-            "base_commit",
-            "last_error",
-            "result_summary",
-            "preferred_agent",
-        }
-        unknown = set(fields) - allowed
-        if unknown:
-            raise ValueError(f"unsupported task fields: {sorted(unknown)}")
-        if not fields:
-            return
-        values: dict[str, Any] = dict(fields)
-        if isinstance(values.get("state"), TaskState):
-            values["state"] = values["state"].value
-        values["updated_at"] = utc_ts()
-        assignments = ", ".join(f"{key} = ?" for key in values)
-        params = (*values.values(), task_id)
-        self._execute(f"UPDATE tasks SET {assignments} WHERE id = ?", params)
-
-    def start_attempt(
-        self,
-        *,
-        job_id: str,
-        task_id: str,
-        number: int,
-        agent: str,
-        worktree: str,
-        branch: str,
-        log_path: str,
-    ) -> str:
-        attempt_id = new_id("attempt")
-        self._execute(
-            """
-            INSERT INTO attempts(
-              id, job_id, task_id, number, agent, state, worktree, branch, log_path, started_at
-            ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
-            """,
-            (attempt_id, job_id, task_id, number, agent, worktree, branch, log_path, utc_ts()),
-        )
-        return attempt_id
-
-    def finish_attempt(
-        self,
-        attempt_id: str,
-        *,
-        state: str,
-        returncode: int | None,
-        summary: str,
-    ) -> None:
-        self._execute(
-            """
-            UPDATE attempts
-            SET state = ?, returncode = ?, summary = ?, finished_at = ?
-            WHERE id = ?
-            """,
-            (state, returncode, summary, utc_ts(), attempt_id),
-        )
 
     def event(
         self,
@@ -382,9 +294,14 @@ class RecordsMixin(DatabaseCore):
         return int(row["id"]) if row is not None else 0
 
     def request_stop(self, job_id: str) -> None:
-        self.update_job(job_id, stop_requested=True, state=JobState.STOPPING)
+        self.update_job(job_id, stop_requested=True, state=JobState.STOPPING)  # type: ignore[attr-defined]
         self.event(job_id, "job.stop_requested")
 
     def clear_stop(self, job_id: str) -> None:
-        self.update_job(job_id, stop_requested=False, state=JobState.QUEUED, error="")
+        self.update_job(  # type: ignore[attr-defined]
+            job_id,
+            stop_requested=False,
+            state=JobState.QUEUED,
+            error="",
+        )
         self.event(job_id, "job.resumed")

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.1 - 2026-08-24
+
+- Make the execution dossier a true publication boundary: accepted dossiers are staged privately, then dossier visibility, `COMPLETED`, final summary and acceptance/apply events are committed in one SQLite transaction.
+- Refuse direct ordinary transitions into `COMPLETED`; `yolo-dossier` now exposes only durably published dossiers for completed jobs and rejects mismatched or tampered dossier digests.
+- Move job/task/attempt transition read-validation-write sequences behind `BEGIN IMMEDIATE` transactions with stale-state guards, while coupling task activation to a legal running job state so impossible durable snapshots cannot be published.
+- Enforce attempt ownership twice: the runtime checks that the task belongs to the supplied job, and schema v3 adds a composite `attempts(job_id, task_id) -> tasks(job_id, id)` foreign key.
+- Harden recovery origin validation so interrupted active jobs and explicit stopping jobs follow distinct modeled paths and completed jobs remain absorbing.
+- Upgrade SQLite startup validation from `quick_check` alone to the complete table-column, index, foreign-key and relational contract; current-version malformed schemas fail before self-healing DDL can obscure the defect, while valid ALTER TABLE column ordering remains accepted.
+- Add a live resource-governance backend probe to `yolo doctor`; a configured systemd/cgroups policy that cannot actually be applied is now a readiness failure instead of a paper configuration.
+- Remove superseded DB mutation implementations that could otherwise become future bypass surfaces, and add targeted failure-injection tests for publication rollback/tampering, schema corruption, migration rollback, relational ownership, dossier CLI safety and resource probing.
+- Keep all existing verification gates intact while expanding trust-boundary module floors; the release candidate passes 177 tests at 84% aggregate branch coverage before the final version-only synchronization.
+- Synchronize runtime, package metadata, clean-wheel verification and the Omarchy Quickshell manifest at `1.4.1`.
+
 ## 1.4.0 - 2026-08-23
 
 - Add an executable orchestration state reference model covering every job/task/attempt transition plus cross-record terminal-state invariants; ordinary durable state mutations fail closed on illegal transitions while transactional recovery keeps its explicit modeled recovery paths.

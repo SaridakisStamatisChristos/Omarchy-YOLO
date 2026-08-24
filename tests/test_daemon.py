@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,21 @@ async def test_completed_job_cannot_be_stopped(
     daemon = make_daemon(tmp_path, monkeypatch)
     job = make_job(daemon)
     daemon.db.update_job(job.id, state=JobState.RUNNING)
-    daemon.db.update_job(job.id, state=JobState.COMPLETED)
+    content = "{}"
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    daemon.db.stage_dossier(
+        job.id,
+        schema_version=1,
+        sha256=digest,
+        content=content,
+    )
+    daemon.db.publish_completed_job(
+        job.id,
+        dossier_schema_version=1,
+        dossier_sha256=digest,
+        final_summary="accepted",
+        source_apply_outcome="not-requested",
+    )
     with pytest.raises(YoloError, match="immutable"):
         await daemon.dispatch("stop", {"job_id": job.id})
     daemon.db.close()

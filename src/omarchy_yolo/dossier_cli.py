@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .config import load_config
 from .db import Database
+from .model import JobState
 from .provenance import verify_dossier
 from .util import YoloError, ensure_private_dir, open_private_binary, validate_job_id
 
@@ -30,12 +31,14 @@ def run(args: argparse.Namespace) -> int:
     config = load_config()
     db = Database(config.db_path)
     try:
-        db.get_job(job_id)
+        job = db.get_job(job_id)
+        if job.state != JobState.COMPLETED or job.stop_requested:
+            raise YoloError("execution dossier is not available until durable job completion")
         record = db.get_dossier(job_id)
     finally:
         db.close()
     if record is None:
-        raise YoloError("execution dossier is not available until final acceptance")
+        raise YoloError("completed job has no published execution dossier")
 
     content = str(record["content"])
     digest = str(record["sha256"])

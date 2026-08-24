@@ -12,7 +12,7 @@ from .model import JobRecord, JobState, TaskRecord, TaskState
 from .util import YoloError, ensure_private_dir
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 LEGACY_SCHEMA_VERSION = 1
 
 _PRAGMAS = (
@@ -63,10 +63,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   UNIQUE(job_id, logical_id)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_job_id_id ON tasks(job_id, id);
+
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  task_id TEXT NOT NULL,
   number INTEGER NOT NULL,
   agent TEXT NOT NULL,
   state TEXT NOT NULL,
@@ -77,6 +79,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   finished_at REAL,
   returncode INTEGER,
   summary TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY(job_id, task_id) REFERENCES tasks(job_id, id) ON DELETE CASCADE,
   UNIQUE(task_id, number)
 );
 
@@ -94,6 +97,7 @@ CREATE TABLE IF NOT EXISTS dossiers (
   schema_version INTEGER NOT NULL,
   sha256 TEXT NOT NULL,
   content TEXT NOT NULL,
+  published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0, 1)),
   created_at REAL NOT NULL
 );
 
@@ -103,6 +107,8 @@ CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
 
+# Schema v1 was the original unversioned durable store. v2 added dossiers. v3
+# makes dossier publication explicit and makes attempt ownership relational.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
         """
@@ -115,6 +121,156 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    2: (
+        # Very early legacy fixtures contained only jobs. Materialize the v2
+        # parent tables first so the v2 -> v3 migration remains deterministic.
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+          id TEXT PRIMARY KEY,
+          job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          seq INTEGER NOT NULL,
+          logical_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL,
+          state TEXT NOT NULL,
+          dependencies TEXT NOT NULL DEFAULT '[]',
+          acceptance TEXT NOT NULL DEFAULT '[]',
+          preferred_agent TEXT,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          branch TEXT NOT NULL DEFAULT '',
+          worktree TEXT NOT NULL DEFAULT '',
+          base_commit TEXT NOT NULL DEFAULT '',
+          last_error TEXT NOT NULL DEFAULT '',
+          result_summary TEXT NOT NULL DEFAULT '',
+          created_at REAL NOT NULL,
+          updated_at REAL NOT NULL,
+          UNIQUE(job_id, logical_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS attempts (
+          id TEXT PRIMARY KEY,
+          job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          number INTEGER NOT NULL,
+          agent TEXT NOT NULL,
+          state TEXT NOT NULL,
+          worktree TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          log_path TEXT NOT NULL,
+          started_at REAL NOT NULL,
+          finished_at REAL,
+          returncode INTEGER,
+          summary TEXT NOT NULL DEFAULT '',
+          UNIQUE(task_id, number)
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_job_id_id ON tasks(job_id, id)",
+        "ALTER TABLE dossiers ADD COLUMN published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0, 1))",
+        """
+        UPDATE dossiers
+        SET published = 1
+        WHERE job_id IN (
+          SELECT id FROM jobs WHERE state = 'completed' AND stop_requested = 0
+        )
+        """,
+        """
+        CREATE TABLE attempts_v3 (
+          id TEXT PRIMARY KEY,
+          job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL,
+          number INTEGER NOT NULL,
+          agent TEXT NOT NULL,
+          state TEXT NOT NULL,
+          worktree TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          log_path TEXT NOT NULL,
+          started_at REAL NOT NULL,
+          finished_at REAL,
+          returncode INTEGER,
+          summary TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY(job_id, task_id) REFERENCES tasks(job_id, id) ON DELETE CASCADE,
+          UNIQUE(task_id, number)
+        )
+        """,
+        """
+        INSERT INTO attempts_v3(
+          id, job_id, task_id, number, agent, state, worktree, branch,
+          log_path, started_at, finished_at, returncode, summary
+        )
+        SELECT
+          id, job_id, task_id, number, agent, state, worktree, branch,
+          log_path, started_at, finished_at, returncode, summary
+        FROM attempts
+        """,
+        "DROP TABLE attempts",
+        "ALTER TABLE attempts_v3 RENAME TO attempts",
+        "CREATE INDEX IF NOT EXISTS idx_attempts_job_task ON attempts(job_id, task_id, number DESC)",
+    ),
+}
+
+_EXPECTED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "jobs": (
+        "id",
+        "repo",
+        "goal",
+        "state",
+        "base_branch",
+        "base_commit",
+        "integration_branch",
+        "integration_path",
+        "auto_apply",
+        "stop_requested",
+        "final_summary",
+        "error",
+        "created_at",
+        "updated_at",
+    ),
+    "tasks": (
+        "id",
+        "job_id",
+        "seq",
+        "logical_id",
+        "title",
+        "description",
+        "state",
+        "dependencies",
+        "acceptance",
+        "preferred_agent",
+        "attempts",
+        "branch",
+        "worktree",
+        "base_commit",
+        "last_error",
+        "result_summary",
+        "created_at",
+        "updated_at",
+    ),
+    "attempts": (
+        "id",
+        "job_id",
+        "task_id",
+        "number",
+        "agent",
+        "state",
+        "worktree",
+        "branch",
+        "log_path",
+        "started_at",
+        "finished_at",
+        "returncode",
+        "summary",
+    ),
+    "events": ("id", "job_id", "task_id", "kind", "payload", "created_at"),
+    "dossiers": ("job_id", "schema_version", "sha256", "content", "published", "created_at"),
+}
+
+_EXPECTED_INDEXES: dict[str, tuple[str, tuple[str, ...], bool]] = {
+    "idx_tasks_job_state": ("tasks", ("job_id", "state"), False),
+    "idx_tasks_job_id_id": ("tasks", ("job_id", "id"), True),
+    "idx_attempts_job_task": ("attempts", ("job_id", "task_id", "number"), False),
+    "idx_events_job_id": ("events", ("job_id", "id"), False),
+    "idx_jobs_created": ("jobs", ("created_at",), False),
 }
 
 MAX_JOB_LIST_LIMIT = 200
@@ -157,12 +313,15 @@ class DatabaseCore:
                     if version < CURRENT_SCHEMA_VERSION:
                         self.last_migration_backup = self._backup_before_migration(version)
                         self._migrate(version)
+                    else:
+                        # A database already claiming the current schema must first
+                        # prove its table/column contract. Do not let CREATE INDEX or
+                        # other idempotent DDL obscure structural corruption with a
+                        # secondary "no such column" error.
+                        self._validate_table_columns_contract()
                     self._conn.executescript(SCHEMA)
                     self._set_schema_version(CURRENT_SCHEMA_VERSION)
-                check = self._conn.execute("PRAGMA quick_check").fetchone()
-                if check is None or str(check[0]).lower() != "ok":
-                    detail = str(check[0]) if check is not None else "no result"
-                    raise sqlite3.DatabaseError(f"quick_check failed: {detail}")
+                self._validate_integrity_and_schema()
         except (sqlite3.DatabaseError, OSError) as exc:
             connection = getattr(self, "_conn", None)
             if connection is not None:
@@ -226,6 +385,90 @@ class DatabaseCore:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+    def _validate_integrity_and_schema(self) -> None:
+        check = self._conn.execute("PRAGMA quick_check").fetchone()
+        if check is None or str(check[0]).lower() != "ok":
+            detail = str(check[0]) if check is not None else "no result"
+            raise sqlite3.DatabaseError(f"quick_check failed: {detail}")
+        fk_rows = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_rows:
+            raise sqlite3.DatabaseError("foreign_key_check found relational violations")
+        self._validate_schema_contract()
+
+    def _validate_table_columns_contract(self) -> None:
+        for table, expected in _EXPECTED_COLUMNS.items():
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            actual = tuple(str(row["name"]) for row in rows)
+            # SQLite ALTER TABLE appends columns, so a valid migrated schema can
+            # have a different physical column order than a fresh database. All
+            # production writes name columns explicitly; membership is the trust
+            # invariant, not ordinal position.
+            if len(actual) != len(expected) or set(actual) != set(expected):
+                raise sqlite3.DatabaseError(
+                    f"schema contract mismatch for {table}: expected columns {expected}, got {actual}"
+                )
+
+    def _validate_schema_contract(self) -> None:
+        self._validate_table_columns_contract()
+
+        for name, (table, expected_columns, expected_unique) in _EXPECTED_INDEXES.items():
+            index_rows = self._conn.execute(f"PRAGMA index_list({table})").fetchall()
+            match = next((row for row in index_rows if str(row["name"]) == name), None)
+            if match is None:
+                raise sqlite3.DatabaseError(f"schema contract missing index {name}")
+            actual_unique = bool(match["unique"])
+            columns = tuple(
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA index_info({name})").fetchall()
+            )
+            if columns != expected_columns or actual_unique != expected_unique:
+                raise sqlite3.DatabaseError(
+                    f"schema contract mismatch for index {name}: columns={columns}, unique={actual_unique}"
+                )
+
+        task_fks = self._foreign_key_signatures("tasks")
+        if ("jobs", "CASCADE", (("job_id", "id"),)) not in task_fks:
+            raise sqlite3.DatabaseError("schema contract missing tasks.job_id -> jobs.id")
+
+        attempt_fks = self._foreign_key_signatures("attempts")
+        if ("jobs", "CASCADE", (("job_id", "id"),)) not in attempt_fks:
+            raise sqlite3.DatabaseError("schema contract missing attempts.job_id -> jobs.id")
+        if (
+            "tasks",
+            "CASCADE",
+            (("job_id", "job_id"), ("task_id", "id")),
+        ) not in attempt_fks:
+            raise sqlite3.DatabaseError(
+                "schema contract missing attempts(job_id, task_id) ownership foreign key"
+            )
+
+        event_fks = self._foreign_key_signatures("events")
+        if ("jobs", "CASCADE", (("job_id", "id"),)) not in event_fks:
+            raise sqlite3.DatabaseError("schema contract missing events.job_id -> jobs.id")
+
+        dossier_fks = self._foreign_key_signatures("dossiers")
+        if ("jobs", "CASCADE", (("job_id", "id"),)) not in dossier_fks:
+            raise sqlite3.DatabaseError("schema contract missing dossiers.job_id -> jobs.id")
+
+    def _foreign_key_signatures(
+        self, table: str
+    ) -> set[tuple[str, str, tuple[tuple[str, str], ...]]]:
+        groups: dict[int, list[sqlite3.Row]] = {}
+        for row in self._conn.execute(f"PRAGMA foreign_key_list({table})").fetchall():
+            groups.setdefault(int(row["id"]), []).append(row)
+        signatures: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+        for rows in groups.values():
+            ordered = sorted(rows, key=lambda row: int(row["seq"]))
+            first = ordered[0]
+            signatures.add(
+                (
+                    str(first["table"]),
+                    str(first["on_delete"]).upper(),
+                    tuple((str(row["from"]), str(row["to"])) for row in ordered),
+                )
+            )
+        return signatures
 
     def close(self) -> None:
         with self._lock:

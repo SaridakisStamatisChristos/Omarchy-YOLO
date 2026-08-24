@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from dataclasses import dataclass
 
 from .util import YoloError
@@ -41,16 +42,18 @@ class ResourcePolicy:
             properties.append(f"IOWeight={self.io_weight}")
         return properties
 
-    def wrap(self, argv: list[str]) -> list[str]:
-        if not self.enabled:
-            return list(argv)
+    def _systemd_run(self) -> str:
         if self.backend != "systemd":
             raise YoloError(f"unknown resource-control backend: {self.backend}")
         systemd_run = shutil.which("systemd-run")
         if systemd_run is None:
-            raise YoloError(
-                "resources.backend='systemd' requires systemd-run on PATH"
-            )
+            raise YoloError("resources.backend='systemd' requires systemd-run on PATH")
+        return systemd_run
+
+    def wrap(self, argv: list[str]) -> list[str]:
+        if not self.enabled:
+            return list(argv)
+        systemd_run = self._systemd_run()
         wrapped = [
             systemd_run,
             "--user",
@@ -63,6 +66,40 @@ class ResourcePolicy:
         wrapped.append("--")
         wrapped.extend(argv)
         return wrapped
+
+    def probe(self, *, timeout_seconds: int = 10) -> tuple[bool, str]:
+        """Live-check the selected enforcement backend for `yolo doctor`."""
+        if not self.enabled:
+            return True, "disabled"
+        try:
+            systemd_run = self._systemd_run()
+        except YoloError as exc:
+            return False, str(exc)
+        true_executable = shutil.which("true") or "/usr/bin/true"
+        try:
+            result = subprocess.run(
+                [
+                    systemd_run,
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    "--",
+                    true_executable,
+                ],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(1, min(30, timeout_seconds)),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"systemd user-scope probe failed: {exc}"
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            return False, f"systemd user-scope unavailable: {detail or f'rc={result.returncode}'}"
+        return True, systemd_run
 
     def contract(self) -> dict[str, object]:
         return {
