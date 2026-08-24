@@ -52,6 +52,29 @@ def _stage(db: Database, job_id: str, content: str = '{"ok":true}') -> str:
     return digest
 
 
+def _prepare(
+    db: Database,
+    job_id: str,
+    *,
+    content: str,
+    digest: str,
+    summary: str,
+    intent: str = "not-requested",
+) -> None:
+    accepted_commit = "b" * 40
+    db.prepare_accepted_job(
+        job_id,
+        accepted_commit=accepted_commit,
+        final_summary=summary,
+        source_apply_intent=intent,
+        dossier_schema_version=1,
+        dossier_sha256=digest,
+        dossier_content=content,
+    )
+    if intent == "requested":
+        db.mark_apply_started(job_id, accepted_commit=accepted_commit)
+
+
 def test_stage_validation_store_compatibility_and_idempotent_publication(
     tmp_path: Path,
 ) -> None:
@@ -75,6 +98,7 @@ def test_stage_validation_store_compatibility_and_idempotent_publication(
             sha256=digest,
             content=content,
         )
+        _prepare(db, job_id, content=content, digest=digest, summary="accepted")
         db.publish_completed_job(
             job_id,
             dossier_schema_version=1,
@@ -92,7 +116,7 @@ def test_stage_validation_store_compatibility_and_idempotent_publication(
         )
         assert db.last_event_id(job_id) == before
 
-        with pytest.raises(StateTransitionError, match="completed job"):
+        with pytest.raises(StateTransitionError, match="completed job|acceptance begins"):
             db.stage_dossier(
                 job_id,
                 schema_version=1,
@@ -160,27 +184,41 @@ def test_publication_rejects_running_attempt_and_records_apply_outcomes(
     db = Database(tmp_path / "state" / "state.sqlite3")
     try:
         running_job, running_task = _completed_task_job(db, tmp_path, suffix="running-attempt")
-        running_digest = _stage(db, running_job)
-        db.start_attempt(
-            job_id=running_job,
-            task_id=running_task,
-            number=1,
-            agent="synthetic",
-            worktree="/tmp/worktree",
-            branch="yolo/synthetic",
-            log_path="/tmp/attempt.log",
+        running_content = '{"ok":true}'
+        running_digest = _stage(db, running_job, running_content)
+        # Seed an impossible historical/corrupt row directly. The guarded public
+        # API correctly refuses to create a running attempt for a completed task;
+        # publication must still fail closed if such a row exists on disk.
+        db._execute(
+            """
+            INSERT INTO attempts(
+              id, job_id, task_id, number, agent, state, worktree, branch,
+              log_path, started_at
+            ) VALUES ('attempt_corrupt', ?, ?, 1, 'synthetic', 'running',
+                      '/tmp/worktree', 'yolo/synthetic', '/tmp/attempt.log', 0)
+            """,
+            (running_job, running_task),
         )
-        with pytest.raises(StateTransitionError, match="running attempt"):
-            db.publish_completed_job(
+        with pytest.raises(StateTransitionError, match="running attempt|not in flight"):
+            _prepare(
+                db,
                 running_job,
-                dossier_schema_version=1,
-                dossier_sha256=running_digest,
-                final_summary="must fail",
-                source_apply_outcome="not-requested",
+                content=running_content,
+                digest=running_digest,
+                summary="must fail",
             )
 
         applied_job, _ = _completed_task_job(db, tmp_path, suffix="applied")
-        applied_digest = _stage(db, applied_job)
+        applied_content = '{"applied":true}'
+        applied_digest = _stage(db, applied_job, applied_content)
+        _prepare(
+            db,
+            applied_job,
+            content=applied_content,
+            digest=applied_digest,
+            summary="applied",
+            intent="requested",
+        )
         db.publish_completed_job(
             applied_job,
             dossier_schema_version=1,
@@ -192,7 +230,16 @@ def test_publication_rejects_running_attempt_and_records_apply_outcomes(
         assert "job.applied" in applied_kinds
 
         skipped_job, _ = _completed_task_job(db, tmp_path, suffix="skipped")
-        skipped_digest = _stage(db, skipped_job)
+        skipped_content = '{"skipped":true}'
+        skipped_digest = _stage(db, skipped_job, skipped_content)
+        _prepare(
+            db,
+            skipped_job,
+            content=skipped_content,
+            digest=skipped_digest,
+            summary="skipped",
+            intent="requested",
+        )
         db.publish_completed_job(
             skipped_job,
             dossier_schema_version=1,
@@ -224,6 +271,7 @@ def test_dossier_cli_plain_output_missing_publication_symlink_and_main_error(
         job_id, _ = _completed_task_job(db, tmp_path, suffix="cli")
         content = '{"cli":"plain"}'
         digest = _stage(db, job_id, content)
+        _prepare(db, job_id, content=content, digest=digest, summary="accepted")
         db.publish_completed_job(
             job_id,
             dossier_schema_version=1,
