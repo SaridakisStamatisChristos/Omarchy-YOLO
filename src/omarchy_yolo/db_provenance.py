@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from .db_core import DatabaseCore
-from .model import JobState, TaskState
+from .model import JobState
 from .state_machine import StateTransitionError, validate_job_snapshot, validate_job_transition
 from .util import json_dumps, utc_ts
 
