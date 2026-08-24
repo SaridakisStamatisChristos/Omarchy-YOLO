@@ -49,11 +49,14 @@ async def test_completed_job_cannot_be_stopped(
     daemon.db.update_job(job.id, state=JobState.RUNNING)
     content = "{}"
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    daemon.db.stage_dossier(
+    daemon.db.prepare_accepted_job(
         job.id,
-        schema_version=1,
-        sha256=digest,
-        content=content,
+        accepted_commit="b" * 40,
+        final_summary="accepted",
+        source_apply_intent="not-requested",
+        dossier_schema_version=1,
+        dossier_sha256=digest,
+        dossier_content=content,
     )
     daemon.db.publish_completed_job(
         job.id,
