@@ -13,6 +13,7 @@ from .db_records import RecordsMixin
 from .db_recovery import RecoveryMixin
 from .model import AttemptState, JobState, TaskState
 from .state_machine import (
+    INFLIGHT_TASK_STATES,
     StateTransitionError,
     validate_attempt_transition,
     validate_job_snapshot,
@@ -138,9 +139,36 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                 target = TaskState(values.get("state", current))
                 validate_task_transition(current, target)
 
+                now = utc_ts()
+                job_row = self._conn.execute(
+                    "SELECT state FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if job_row is None:
+                    raise KeyError(job_id)
+                job_state = JobState(str(job_row["state"]))
+                if target in INFLIGHT_TASK_STATES and job_state in {
+                    JobState.QUEUED,
+                    JobState.PLANNING,
+                }:
+                    # A committed in-flight task and a queued/planning job would be
+                    # an impossible snapshot. Couple these legal transitions inside
+                    # the same transaction so callers cannot publish that state.
+                    validate_job_transition(job_state, JobState.RUNNING)
+                    job_cur = self._conn.execute(
+                        """
+                        UPDATE jobs SET state = ?, updated_at = ?
+                        WHERE id = ? AND state = ?
+                        """,
+                        (JobState.RUNNING.value, now, job_id, job_state.value),
+                    )
+                    if job_cur.rowcount != 1:
+                        raise StateTransitionError(
+                            f"stale job state while activating task {task_id}"
+                        )
+
                 if "state" in values:
                     values["state"] = target.value
-                values["updated_at"] = utc_ts()
+                values["updated_at"] = now
                 assignments = ", ".join(f"{key} = ?" for key in values)
                 params = (*values.values(), task_id, current.value)
                 cur = self._conn.execute(
