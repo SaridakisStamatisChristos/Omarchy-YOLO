@@ -64,7 +64,6 @@ def test_recovery_cancels_running_attempt_but_preserves_history(tmp_path: Path) 
     db.close()
 
 
-
 def test_recovery_preserves_explicit_stop(tmp_path: Path) -> None:
     db = Database(tmp_path / "state.db")
     job = db.create_job(
@@ -110,8 +109,14 @@ def test_prepare_resume_closes_stale_attempt_and_preserves_attempt_number(tmp_pa
     )
     task = db.add_tasks(job.id, [PlannedTask("T1", "Title", "Description")])[0]
     db.update_job(job.id, state=JobState.FAILED, error="boom")
-    db.update_task(task.id, state=TaskState.RUNNING, attempts=3, last_error="useful context")
-    db.update_task(task.id, state=TaskState.REVIEWING)
+
+    # Recovery tests intentionally emulate a stale pre-v1.4.1 durable snapshot.
+    # The guarded public mutation API must reject FAILED + in-flight task, so seed
+    # that historical state directly and verify prepare_resume repairs it atomically.
+    db._execute(
+        "UPDATE tasks SET state = ?, attempts = ?, last_error = ? WHERE id = ?",
+        (TaskState.REVIEWING.value, 3, "useful context", task.id),
+    )
     attempt_id = db.start_attempt(
         job_id=job.id,
         task_id=task.id,
@@ -152,7 +157,6 @@ def test_list_limits_are_capped(tmp_path: Path) -> None:
     assert len(db.events(job.id, limit=10**9)) == MAX_EVENT_LIST_LIMIT
     assert len(db.list_jobs(limit=10**9)) <= MAX_JOB_LIST_LIMIT
     db.close()
-
 
 
 def test_event_payload_is_bounded_at_rest(tmp_path: Path) -> None:
