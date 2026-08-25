@@ -1,3 +1,10 @@
+[safety]
+# trusted-local: compatibility defaults for repositories you trust.
+# hostile-repo: enforce Bubblewrap, masked/read-only HOME, offline review/gates,
+# and neutralized repository-configured Git commands.
+# custom: explicitly document a hand-tuned policy; inspect it with `yolo doctor`.
+preset = "trusted-local"
+
 [engine]
 # Per-job parallel task ceiling.
 max_parallel = 4
@@ -19,7 +26,6 @@ execution_profile = "yolo-worktree"
 # reviewed first, multi-shard files are semantically synthesized, then file-level
 # reports are synthesized across the release.
 final_review_chunk_bytes = 60000
-final_review_chunk_files = 8
 final_review_max_files = 512
 # Binary changes are rejected by default because semantic content cannot be
 # inspected. Set true only to explicitly permit metadata-only binary review.
@@ -53,6 +59,11 @@ final_commands = []
 # none: no external confinement; still runs as your normal user, never sudo.
 backend = "native"
 network = true
+# Optional profile-specific overrides. When omitted they inherit `network`,
+# except hostile mode always keeps gates offline. The hostile-repo preset sets
+# both to false and rejects conflicting true values.
+# review_network = false
+# gate_network = false
 # With bwrap, review/planning always sees HOME read-only. Worker mode can also
 # make HOME read-only and selectively re-enable only the credential/session dirs
 # required by a coding CLI. In hostile mode HOME is hidden: these directories are

@@ -7,13 +7,13 @@ from .agents import AgentRegistry
 from .config import Config
 from .db import Database
 from .gates import GateRunner
-from .git import GitError, GitRepo
+from .git import GitRepo
 from .model import AgentRole, JobRecord, JobState, PlannedTask, TaskState
 from .omarchy import notify
 from .orchestrator_integration import IntegrationMixin
 from .orchestrator_task import TaskExecutionMixin
 from .planner import Planner
-from .provenance import DOSSIER_SCHEMA_VERSION, build_dossier
+from .provenance import DOSSIER_SCHEMA_VERSION, build_dossier, verify_dossier
 from .reviewer import Reviewer
 from .runtime import ResourceCoordinator
 from .sandbox import Sandbox
@@ -57,6 +57,28 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         job_root = ensure_private_dir(self.config.worktrees_dir / job_id)
         integration_path = job_root / "integration"
         try:
+            # Acceptance is a one-way semantic boundary. If the daemon crashed
+            # after journaling ACCEPTED/APPLYING, never re-plan or re-review the
+            # candidate: reconcile the external Git side effect and publish the
+            # already accepted result idempotently.
+            if job.acceptance_phase in {"accepted", "applying"}:
+                await finish_before_cancel(self._resume_accepted_job(job, repo))
+                completed = self.db.get_job(job_id)
+                if self.config.engine.cleanup_worktrees:
+                    stored_integration = Path(completed.integration_path or integration_path)
+                    try:
+                        await self._cleanup_completed(repo, job_id, stored_integration)
+                    except asyncio.CancelledError:
+                        self.db.event(job_id, "job.cleanup_interrupted")
+                        raise
+                    except Exception as exc:
+                        self.db.event(
+                            job_id,
+                            "job.cleanup_failed",
+                            {"error": str(exc)[-4_000:]},
+                        )
+                return
+
             async with self.coordinator.repo_lock(repo.root):
                 await atomic_to_thread(
                     repo.ensure_existing_branch_worktree,
@@ -92,9 +114,9 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             async with self.coordinator.worker_slot():
                 final_summary = await self._finalize(job_id, repo, integration_path)
             job = self.db.get_job(job_id)
-            # Final review is the acceptance boundary. Dossier bytes are staged
-            # privately before optional source application, then dossier publication
-            # and durable COMPLETED state become visible in one SQLite transaction.
+            # Final review is the semantic acceptance boundary. The accepted
+            # commit, apply intent and dossier are journaled before any source
+            # branch mutation so a hard crash is reconcilable on restart.
             await finish_before_cancel(
                 self._complete_accepted_job(job, repo, final_summary)
             )
@@ -115,6 +137,15 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             await self._cancel_active()
             current = self.db.get_job(job_id)
             if current.state == JobState.COMPLETED:
+                raise
+            if current.acceptance_phase in {"accepted", "applying"}:
+                # Do not regress accepted work into queued/stopped states. A future
+                # daemon run will reconcile the journaled acceptance operation.
+                self.db.event(
+                    job_id,
+                    "job.acceptance_recovery_required",
+                    {"phase": current.acceptance_phase, "reason": "orchestrator cancelled"},
+                )
                 raise
             if current.stop_requested:
                 self.db.settle_inflight(
@@ -138,6 +169,22 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             raise
         except Exception as exc:
             await self._cancel_active()
+            current = self.db.get_job(job_id)
+            if current.acceptance_phase in {"accepted", "applying"}:
+                self.db.event(
+                    job_id,
+                    "job.acceptance_recovery_required",
+                    {
+                        "phase": current.acceptance_phase,
+                        "accepted_commit": current.accepted_commit,
+                        "error": str(exc)[-4_000:],
+                    },
+                )
+                notify(
+                    "YOLO acceptance recovery required",
+                    f"{Path(current.repo).name}: {str(exc)[:180]}",
+                )
+                raise
             self.db.settle_inflight(
                 job_id,
                 task_state=TaskState.FAILED,
@@ -167,34 +214,65 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
             final_summary=final_summary,
             source_apply_intent="requested" if accepted.auto_apply else "not-requested",
         )
-        self.db.stage_dossier(
+        self.db.prepare_accepted_job(
             accepted.id,
-            schema_version=DOSSIER_SCHEMA_VERSION,
-            sha256=dossier_sha256,
-            content=dossier_content,
+            accepted_commit=final_commit,
+            final_summary=final_summary,
+            source_apply_intent="requested" if accepted.auto_apply else "not-requested",
+            dossier_schema_version=DOSSIER_SCHEMA_VERSION,
+            dossier_sha256=dossier_sha256,
+            dossier_content=dossier_content,
         )
+        await self._resume_accepted_job(self.db.get_job(accepted.id), repo)
+
+    async def _resume_accepted_job(self, accepted: JobRecord, repo: GitRepo) -> None:
+        if accepted.acceptance_phase not in {"accepted", "applying"}:
+            raise YoloError(
+                f"cannot reconcile acceptance from phase {accepted.acceptance_phase}"
+            )
+        if not accepted.accepted_commit:
+            raise YoloError("accepted job is missing its durable accepted commit")
+        dossier = self.db.get_staged_dossier(accepted.id)
+        if dossier is None or bool(dossier["published"]):
+            raise YoloError("accepted job is missing its unpublished staged dossier")
+        dossier_schema_version = int(dossier["schema_version"])
+        dossier_sha256 = str(dossier["sha256"])
+        dossier_content = str(dossier["content"])
+        if dossier_schema_version != DOSSIER_SCHEMA_VERSION:
+            raise YoloError(
+                "accepted job staged dossier has an unsupported schema version: "
+                f"{dossier_schema_version}"
+            )
+        if not verify_dossier(dossier_content, dossier_sha256):
+            raise YoloError("accepted job staged dossier failed SHA-256 verification")
 
         source_apply_outcome = "not-requested"
         source_apply_reason = ""
-        if accepted.auto_apply:
-            try:
-                async with self.coordinator.repo_lock(repo.root):
-                    await atomic_to_thread(
-                        repo.fast_forward_source,
-                        accepted.integration_branch,
-                        accepted.base_branch,
-                        accepted.base_commit,
-                    )
-                source_apply_outcome = "applied"
-            except GitError as exc:
-                source_apply_outcome = "skipped"
-                source_apply_reason = str(exc)
+        if accepted.source_apply_intent == "requested":
+            if accepted.acceptance_phase == "accepted":
+                self.db.mark_apply_started(
+                    accepted.id,
+                    accepted_commit=accepted.accepted_commit,
+                )
+                accepted = self.db.get_job(accepted.id)
+            async with self.coordinator.repo_lock(repo.root):
+                source_apply_outcome, source_apply_reason = await atomic_to_thread(
+                    repo.reconcile_fast_forward_source,
+                    accepted.integration_branch,
+                    accepted.base_branch,
+                    accepted.base_commit,
+                    accepted.accepted_commit,
+                )
+        elif accepted.source_apply_intent != "not-requested":
+            raise YoloError(
+                f"invalid durable source apply intent: {accepted.source_apply_intent}"
+            )
 
         self.db.publish_completed_job(
             accepted.id,
-            dossier_schema_version=DOSSIER_SCHEMA_VERSION,
+            dossier_schema_version=dossier_schema_version,
             dossier_sha256=dossier_sha256,
-            final_summary=final_summary,
+            final_summary=accepted.final_summary,
             source_apply_outcome=source_apply_outcome,
             source_apply_reason=source_apply_reason,
         )

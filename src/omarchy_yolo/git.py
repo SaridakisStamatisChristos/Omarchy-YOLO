@@ -100,9 +100,6 @@ class GitRepo:
             if key.startswith("GIT_"):
                 effective.pop(key, None)
         effective.update(identity)
-        # Control-plane Git never needs prompts, pagers, user aliases, global filters,
-        # or system configuration. Repository-local config remains available, with
-        # command-bearing entries neutralized in hostile-repository mode below.
         effective["GIT_PAGER"] = "cat"
         effective["GIT_TERMINAL_PROMPT"] = "0"
         effective["GIT_ASKPASS"] = "/bin/false"
@@ -505,7 +502,6 @@ class GitRepo:
         if out.output_truncated:
             raise GitError("worktree removal produced oversized output")
         if out.returncode != 0:
-            # Only fall back after proving this directory belongs to this repository.
             self.assert_worktree(path)
             shutil.rmtree(path)
             self.run("worktree", "prune")
@@ -653,22 +649,101 @@ class GitRepo:
         self.run("reset", "--hard", commit, cwd=cwd)
         self.run("clean", "-ffdx", cwd=cwd)
 
+    def resolve_branch_commit(self, branch: str) -> str:
+        self._validate_branch_name(branch)
+        out = self.run("rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+        commit = out.stdout.strip()
+        if not commit:
+            raise GitError(f"cannot resolve branch commit: {branch}")
+        return commit
+
     def can_fast_forward_source(self, base_branch: str, base_commit: str) -> tuple[bool, str]:
         if base_branch == "HEAD":
             return False, "source checkout was detached"
-        if self.branch() != base_branch:
-            return False, f"source worktree is now on {self.branch()}, not {base_branch}"
+        current_branch = self.branch()
+        if current_branch != base_branch:
+            return False, f"source worktree is now on {current_branch}, not {base_branch}"
         if not self.is_clean():
             return False, "source worktree is dirty"
         if self.head() != base_commit:
             return False, "source branch moved since job creation"
         return True, "ok"
 
-    def fast_forward_source(self, integration_branch: str, base_branch: str, base_commit: str) -> None:
-        self._validate_branch_name(integration_branch)
-        ok, reason = self.can_fast_forward_source(base_branch, base_commit)
-        if not ok:
-            raise GitError(f"automatic apply refused: {reason}")
-        self.run(
-            "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--", integration_branch
+    def reconcile_fast_forward_source(
+        self,
+        integration_branch: str,
+        base_branch: str,
+        base_commit: str,
+        accepted_commit: str,
+    ) -> tuple[str, str]:
+        """Idempotently reconcile a journaled source-apply operation.
+
+        This deliberately distinguishes policy skips from Git execution failures.
+        A hard crash can occur after the ff-only merge but before SQLite publication;
+        seeing the source already at ``accepted_commit`` is therefore success, not a
+        moved-branch refusal.
+        """
+        integration_commit = self.resolve_branch_commit(integration_branch)
+        if integration_commit != accepted_commit:
+            raise GitError(
+                "accepted integration branch moved after acceptance: "
+                f"expected {accepted_commit}, got {integration_commit}"
+            )
+        if base_branch == "HEAD":
+            return "skipped", "source checkout was detached"
+        current_branch = self.branch()
+        if current_branch != base_branch:
+            return "skipped", f"source worktree is now on {current_branch}, not {base_branch}"
+        if not self.is_clean():
+            return "skipped", "source worktree is dirty"
+
+        current_head = self.head()
+        if current_head == accepted_commit:
+            return "applied", "source already at accepted commit"
+        contains_accepted = self.run(
+            "merge-base",
+            "--is-ancestor",
+            accepted_commit,
+            current_head,
+            check=False,
         )
+        if contains_accepted.timed_out:
+            raise GitError("timed out while checking accepted source ancestry")
+        if contains_accepted.output_truncated:
+            raise GitError("accepted source ancestry check produced oversized output")
+        if contains_accepted.returncode == 0:
+            return "applied", "source already contains accepted commit"
+        if contains_accepted.returncode != 1:
+            raise GitError(
+                "cannot check accepted source ancestry: "
+                f"{contains_accepted.stderr.strip()}"
+            )
+        if current_head != base_commit:
+            return "skipped", "source branch moved since job creation"
+
+        self.run(
+            "-c",
+            "core.hooksPath=/dev/null",
+            "merge",
+            "--ff-only",
+            "--",
+            accepted_commit,
+        )
+        final_head = self.head()
+        if final_head != accepted_commit:
+            raise GitError(
+                "source fast-forward completed at unexpected commit: "
+                f"expected {accepted_commit}, got {final_head}"
+            )
+        return "applied", "source fast-forwarded to accepted commit"
+
+    def fast_forward_source(self, integration_branch: str, base_branch: str, base_commit: str) -> None:
+        accepted_commit = self.resolve_branch_commit(integration_branch)
+        outcome, reason = self.reconcile_fast_forward_source(
+            integration_branch,
+            base_branch,
+            base_commit,
+            accepted_commit,
+        )
+        if outcome != "applied":
+            raise GitError(f"automatic apply refused: {reason}")

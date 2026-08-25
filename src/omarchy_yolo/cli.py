@@ -256,6 +256,14 @@ async def cmd_doctor(_: argparse.Namespace) -> int:
     checks.append(("git", shutil.which("git") is not None, shutil.which("git") or "missing"))
     checks.append(("config", True, str(cfg.config_path)))
     checks.append(("state", True, str(cfg.state_dir)))
+    posture, posture_detail = cfg.trust_posture()
+    checks.append(
+        (
+            "trust-posture",
+            True,
+            f"configured={cfg.safety_preset}; effective={posture}; {posture_detail}",
+        )
+    )
     if cfg.sandbox.backend == "bwrap":
         checks.append(("bubblewrap", shutil.which("bwrap") is not None, shutil.which("bwrap") or "missing"))
     if cfg.resources.enabled:

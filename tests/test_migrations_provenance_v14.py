@@ -66,6 +66,10 @@ def test_legacy_database_migrates_with_private_backup(tmp_path: Path) -> None:
             for row in db._execute("PRAGMA table_info(dossiers)").fetchall()
         }
         assert "published" in columns
+        event_table = db._execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone()
+        assert event_table is not None
     finally:
         db.close()
 
@@ -160,6 +164,15 @@ def test_dossier_is_deterministic_verifiable_and_boundary_stable(tmp_path: Path)
         staged = db.get_staged_dossier(job.id)
         assert staged is not None and staged["published"] is False
 
+        db.prepare_accepted_job(
+            job.id,
+            accepted_commit="b" * 40,
+            final_summary="release accepted",
+            source_apply_intent="not-requested",
+            dossier_schema_version=DOSSIER_SCHEMA_VERSION,
+            dossier_sha256=first_hash,
+            dossier_content=first_content,
+        )
         db.publish_completed_job(
             job.id,
             dossier_schema_version=DOSSIER_SCHEMA_VERSION,

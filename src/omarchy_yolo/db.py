@@ -16,7 +16,6 @@ from .state_machine import (
     INFLIGHT_TASK_STATES,
     StateTransitionError,
     validate_attempt_transition,
-    validate_job_snapshot,
     validate_job_transition,
     validate_task_transition,
 )
@@ -51,27 +50,7 @@ _TASK_FIELDS = {
 
 
 class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
-    """Durable store whose public mutations enforce the executable state model.
-
-    v1.4.1 moves transition read/validation/write and cross-record snapshot checks
-    into one BEGIN IMMEDIATE transaction. Recovery has dedicated multi-record
-    transactions, but those validate their origin and final snapshot before commit.
-    """
-
-    def _snapshot_locked(self, job_id: str) -> tuple[JobState, tuple[TaskState, ...], bool]:
-        job = self._conn.execute(
-            "SELECT state, stop_requested FROM jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        if job is None:
-            raise KeyError(job_id)
-        tasks = self._conn.execute(
-            "SELECT state FROM tasks WHERE job_id = ? ORDER BY seq", (job_id,)
-        ).fetchall()
-        return (
-            JobState(str(job["state"])),
-            tuple(TaskState(str(row["state"])) for row in tasks),
-            bool(job["stop_requested"]),
-        )
+    """Durable store whose public mutations enforce the executable state model."""
 
     def update_job(self, job_id: str, **fields: Any) -> None:
         unknown = set(fields) - _JOB_FIELDS
@@ -83,14 +62,22 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
-                    "SELECT state, stop_requested FROM jobs WHERE id = ?", (job_id,)
+                    "SELECT state, stop_requested, acceptance_phase FROM jobs WHERE id = ?",
+                    (job_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError(job_id)
                 current = JobState(str(row["state"]))
                 values: dict[str, Any] = dict(fields)
+                acceptance_phase = str(row["acceptance_phase"])
+                mutable_after_acceptance = {"state", "stop_requested"}
+                frozen_fields = set(values) - mutable_after_acceptance
+                if acceptance_phase != "none" and frozen_fields:
+                    raise StateTransitionError(
+                        "accepted job metadata is immutable; refusing fields: "
+                        f"{sorted(frozen_fields)}"
+                    )
                 target = JobState(values.get("state", current))
-                target_stop = bool(values.get("stop_requested", row["stop_requested"]))
                 validate_job_transition(current, target)
                 if target == JobState.COMPLETED and current != JobState.COMPLETED:
                     raise StateTransitionError(
@@ -111,9 +98,7 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                     raise StateTransitionError(
                         f"stale job state while updating {job_id}: expected {current.value}"
                     )
-
-                _, task_states, _ = self._snapshot_locked(job_id)
-                validate_job_snapshot(target, task_states, stop_requested=target_stop)
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -141,18 +126,21 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
 
                 now = utc_ts()
                 job_row = self._conn.execute(
-                    "SELECT state FROM jobs WHERE id = ?", (job_id,)
+                    "SELECT state, acceptance_phase FROM jobs WHERE id = ?", (job_id,)
                 ).fetchone()
                 if job_row is None:
                     raise KeyError(job_id)
                 job_state = JobState(str(job_row["state"]))
+                acceptance_phase = str(job_row["acceptance_phase"])
+                if acceptance_phase != "none":
+                    raise StateTransitionError(
+                        f"task graph is immutable after acceptance begins ({acceptance_phase})"
+                    )
+
                 if target in INFLIGHT_TASK_STATES and job_state in {
                     JobState.QUEUED,
                     JobState.PLANNING,
                 }:
-                    # A committed in-flight task and a queued/planning job would be
-                    # an impossible snapshot. Couple these legal transitions inside
-                    # the same transaction so callers cannot publish that state.
                     validate_job_transition(job_state, JobState.RUNNING)
                     job_cur = self._conn.execute(
                         """
@@ -164,6 +152,16 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                     if job_cur.rowcount != 1:
                         raise StateTransitionError(
                             f"stale job state while activating task {task_id}"
+                        )
+
+                if target == TaskState.COMPLETED and current != TaskState.COMPLETED:
+                    running_attempt = self._conn.execute(
+                        "SELECT 1 FROM attempts WHERE task_id = ? AND state = 'running' LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    if running_attempt is not None:
+                        raise StateTransitionError(
+                            "task cannot complete while an owning attempt is still running"
                         )
 
                 if "state" in values:
@@ -179,12 +177,7 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                         f"stale task state while updating {task_id}: expected {current.value}"
                     )
 
-                job_state, task_states, stop_requested = self._snapshot_locked(job_id)
-                validate_job_snapshot(
-                    job_state,
-                    task_states,
-                    stop_requested=stop_requested,
-                )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -205,15 +198,45 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                task = self._conn.execute(
-                    "SELECT job_id FROM tasks WHERE id = ?", (task_id,)
+                row = self._conn.execute(
+                    """
+                    SELECT t.job_id AS owner_job_id, t.state AS task_state,
+                           j.state AS job_state, j.acceptance_phase AS acceptance_phase
+                    FROM tasks AS t
+                    JOIN jobs AS j ON j.id = t.job_id
+                    WHERE t.id = ?
+                    """,
+                    (task_id,),
                 ).fetchone()
-                if task is None:
+                if row is None:
                     raise KeyError(task_id)
-                owner = str(task["job_id"])
+                owner = str(row["owner_job_id"])
                 if owner != job_id:
                     raise YoloError(
                         f"attempt ownership mismatch: task {task_id} belongs to {owner}, not {job_id}"
+                    )
+                job_state = JobState(str(row["job_state"]))
+                task_state = TaskState(str(row["task_state"]))
+                acceptance_phase = str(row["acceptance_phase"])
+                if job_state != JobState.RUNNING:
+                    raise StateTransitionError(
+                        f"attempt start requires running job, got {job_state.value}"
+                    )
+                if task_state != TaskState.RUNNING:
+                    raise StateTransitionError(
+                        f"attempt start requires running task, got {task_state.value}"
+                    )
+                if acceptance_phase != "none":
+                    raise StateTransitionError(
+                        f"attempt cannot start after acceptance begins ({acceptance_phase})"
+                    )
+                running = self._conn.execute(
+                    "SELECT id FROM attempts WHERE task_id = ? AND state = 'running' LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if running is not None:
+                    raise StateTransitionError(
+                        f"task {task_id} already has running attempt {running['id']}"
                     )
                 self._conn.execute(
                     """
@@ -234,6 +257,7 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                         utc_ts(),
                     ),
                 )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -252,12 +276,21 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
-                    "SELECT state FROM attempts WHERE id = ?", (attempt_id,)
+                    "SELECT job_id, state FROM attempts WHERE id = ?", (attempt_id,)
                 ).fetchone()
                 if row is None:
                     raise KeyError(attempt_id)
+                job_id = str(row["job_id"])
                 current = AttemptState(str(row["state"]))
                 target = AttemptState(state)
+                if current != AttemptState.RUNNING:
+                    raise StateTransitionError(
+                        f"attempt {attempt_id} is already finished ({current.value})"
+                    )
+                if target == AttemptState.RUNNING:
+                    raise StateTransitionError(
+                        "finish_attempt requires a terminal attempt state"
+                    )
                 validate_attempt_transition(current, target)
                 cur = self._conn.execute(
                     """
@@ -278,6 +311,7 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                     raise StateTransitionError(
                         f"stale attempt state while updating {attempt_id}: expected {current.value}"
                     )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")

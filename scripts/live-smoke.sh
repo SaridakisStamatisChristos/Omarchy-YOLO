@@ -69,7 +69,6 @@ auto_apply = false
 cleanup_worktrees = false
 execution_profile = "yolo-worktree"
 final_review_chunk_bytes = 60000
-final_review_chunk_files = 1
 final_review_max_files = 16
 final_review_allow_binary = false
 

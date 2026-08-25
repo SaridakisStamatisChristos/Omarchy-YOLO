@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.2 - 2026-08-25
+
+- Journal the exact accepted commit, source-apply intent and staged dossier before any source-branch mutation, then recover `accepted`/`applying` jobs without re-planning or re-reviewing accepted work.
+- Reconcile auto-apply against the immutable journaled commit, recognize a clean source branch that already contains it after a crash, and refuse moved branches, dirty worktrees, detached sources and unexpected integration refs.
+- Verify the staged dossier's schema and SHA-256 before source application, freeze accepted job/task/attempt metadata, and enforce one running attempt plus one terminal write per task attempt.
+- Validate the complete durable job/task/attempt graph and schema contract at mutation, migration, recovery and publication boundaries while preserving atomic publish/rollback behavior.
+- Add named `trusted-local`, `hostile-repo` and `custom` safety presets; keep hostile-repository review and gates offline, neutralize repository commands, and report configured/effective trust posture in `yolo doctor` and dossiers.
+- Remove the obsolete `engine.final_review_chunk_files` knob so raw semantic review shards remain strictly file-local and fail closed on the existing byte/file ceilings.
+- Synchronize runtime, package metadata, clean-wheel verification and the Omarchy Quickshell manifest at `1.4.2`; verify Ruff, Mypy, coverage gates, Python 3.12/3.13, wheel build and clean-wheel entry points in CI.
+
 ## 1.4.1 - 2026-08-24
 
 - Make the execution dossier a true publication boundary: accepted dossiers are staged privately, then dossier visibility, `COMPLETED`, final summary and acceptance/apply events are committed in one SQLite transaction.

@@ -202,19 +202,18 @@ See [SECURITY.md](SECURITY.md) for the exact trust boundaries and the stricter `
 For a repository whose tracked files and gate commands are not trusted, enable the stricter local boundary:
 
 ```toml
+[safety]
+preset = "hostile-repo"
+
 [sandbox]
-backend = "bwrap"
-hostile_repo_mode = true
 network = false
 gate_env_allowlist = []
 agent_env_allowlist = []
 writable_home_paths = []
-
-[git]
-allow_repository_commands = false
 ```
 
-This mode is deliberately opt-in. All child profiles receive a fresh HOME/runtime view and filtered environment.
+This preset is deliberately opt-in and rejects overrides that would re-enable review/gate network, repository Git
+commands, or weaken its Bubblewrap/HOME requirements. All child profiles receive a fresh HOME/runtime view and filtered environment.
 Only `writable_home_paths` are re-exposed to agents (writable for workers/integrators, read-only for
 planners/reviewers); gates receive no HOME exceptions and no network. Control-plane Git neutralizes configured
 clean/smudge/process filters and merge drivers. Agent network follows `sandbox.network`, because remote model CLIs

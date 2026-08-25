@@ -82,7 +82,6 @@ def test_review_shards_never_mix_files(git_repo: Path) -> None:
         base,
         max_files=10,
         chunk_bytes=60_000,
-        chunk_files=8,
     )
     assert manifest == ["a.py", "b.py"]
     assert len(chunks) == 2
@@ -102,7 +101,6 @@ def test_binary_review_fails_closed_unless_explicitly_allowed(git_repo: Path) ->
             base,
             max_files=10,
             chunk_bytes=60_000,
-            chunk_files=8,
         )
 
     manifest, chunks = build_review_chunks(
@@ -111,7 +109,6 @@ def test_binary_review_fails_closed_unless_explicitly_allowed(git_repo: Path) ->
         base,
         max_files=10,
         chunk_bytes=60_000,
-        chunk_files=8,
         allow_binary=True,
     )
     assert manifest == ["artifact.bin"]

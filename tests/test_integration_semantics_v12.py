@@ -75,7 +75,6 @@ async def test_hierarchical_review_synthesizes_multishard_file(
     engine = EngineConfig(
         cleanup_worktrees=False,
         final_review_chunk_bytes=20_000,
-        final_review_chunk_files=8,
         final_review_max_files=20,
     )
     config, db, repo, job_id, integration, _ = _job_and_integration(

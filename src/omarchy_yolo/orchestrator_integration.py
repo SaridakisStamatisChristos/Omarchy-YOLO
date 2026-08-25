@@ -105,15 +105,10 @@ class IntegrationMixin:
                     )
                     return True, ""
                 except BaseException:
-                    # Cancellation is not a commit boundary. Roll back the entire
-                    # integration transaction before the repository lock can be
-                    # released and durable task state is made schedulable again.
                     async def rollback() -> None:
                         try:
                             await atomic_to_thread(repo.abort_merge, integration_path)
                         except Exception:
-                            # A hard reset is the authoritative fallback and also
-                            # clears merge metadata when merge --abort itself fails.
                             pass
                         await atomic_to_thread(repo.reset_hard, integration_path, pre_merge)
 
@@ -325,7 +320,6 @@ class IntegrationMixin:
             job.base_commit,
             max_files=self.config.engine.final_review_max_files,
             chunk_bytes=self.config.engine.final_review_chunk_bytes,
-            chunk_files=self.config.engine.final_review_chunk_files,
             allow_binary=self.config.engine.final_review_allow_binary,
         )
         self.db.event(

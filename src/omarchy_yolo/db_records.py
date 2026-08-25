@@ -6,6 +6,7 @@ from typing import Any
 
 from .db_core import MAX_EVENT_LIST_LIMIT, MAX_EVENT_PAYLOAD_CHARS, MAX_JOB_LIST_LIMIT, DatabaseCore
 from .model import JobRecord, JobState, PlannedTask, TaskRecord, TaskState
+from .state_machine import StateTransitionError
 from .util import json_dumps, new_id, utc_ts
 
 
@@ -49,6 +50,7 @@ class RecordsMixin(DatabaseCore):
                     "INSERT INTO events(job_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
                     (job_id, "job.created", json_dumps({"goal": goal, "repo": repo}), now),
                 )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -73,37 +75,60 @@ class RecordsMixin(DatabaseCore):
         return [self._job_from_row(row) for row in rows]
 
     def add_tasks(self, job_id: str, planned: Iterable[PlannedTask]) -> list[TaskRecord]:
+        planned_tasks = tuple(planned)
         now = utc_ts()
-        rows: list[tuple[Any, ...]] = []
-        for seq, task in enumerate(planned, start=1):
-            rows.append(
-                (
-                    new_id("task"),
-                    job_id,
-                    seq,
-                    task.logical_id,
-                    task.title,
-                    task.description,
-                    TaskState.PENDING.value,
-                    json_dumps(list(task.depends_on)),
-                    json_dumps(list(task.acceptance)),
-                    task.preferred_agent,
-                    now,
-                    now,
-                )
-            )
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._conn.executemany(
-                    """
-                    INSERT INTO tasks(
-                      id, job_id, seq, logical_id, title, description, state,
-                      dependencies, acceptance, preferred_agent, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
+                job = self._conn.execute(
+                    "SELECT state, acceptance_phase FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if job is None:
+                    raise KeyError(job_id)
+                state = JobState(str(job["state"]))
+                phase = str(job["acceptance_phase"])
+                if state not in {JobState.QUEUED, JobState.PLANNING}:
+                    raise StateTransitionError(
+                        f"tasks can only be added while job is queued/planning, got {state.value}"
+                    )
+                if phase != "none":
+                    raise StateTransitionError(
+                        f"tasks cannot be added after acceptance begins ({phase})"
+                    )
+                seq_row = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS seq FROM tasks WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                start_seq = int(seq_row["seq"]) if seq_row is not None else 0
+                rows: list[tuple[Any, ...]] = []
+                for offset, task in enumerate(planned_tasks, start=1):
+                    rows.append(
+                        (
+                            new_id("task"),
+                            job_id,
+                            start_seq + offset,
+                            task.logical_id,
+                            task.title,
+                            task.description,
+                            TaskState.PENDING.value,
+                            json_dumps(list(task.depends_on)),
+                            json_dumps(list(task.acceptance)),
+                            task.preferred_agent,
+                            now,
+                            now,
+                        )
+                    )
+                if rows:
+                    self._conn.executemany(
+                        """
+                        INSERT INTO tasks(
+                          id, job_id, seq, logical_id, title, description, state,
+                          dependencies, acceptance, preferred_agent, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                self._validate_snapshot_locked(job_id)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")

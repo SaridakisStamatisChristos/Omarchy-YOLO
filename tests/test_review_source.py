@@ -24,7 +24,6 @@ def test_hierarchical_review_represents_every_changed_file(git_repo: Path) -> No
         base,
         max_files=10,
         chunk_bytes=30_000,
-        chunk_files=1,
     )
     combined = "\n".join(chunk.text for chunk in chunks)
     assert manifest == ["alpha.txt", "beta.txt"]
@@ -32,6 +31,7 @@ def test_hierarchical_review_represents_every_changed_file(git_repo: Path) -> No
     assert "ALPHA_TAIL" in combined
     assert "BETA_TAIL" in combined
     assert {path for chunk in chunks for path in chunk.files} == set(manifest)
+    assert all(len(chunk.files) <= 1 for chunk in chunks)
 
 
 def test_review_file_limit_fails_closed(git_repo: Path) -> None:
@@ -57,7 +57,6 @@ def test_single_long_line_is_split_without_losing_tail(git_repo: Path) -> None:
         base,
         max_files=10,
         chunk_bytes=20_000,
-        chunk_files=4,
     )
     assert manifest == ["long.txt"]
     assert len(chunks) >= 6
@@ -84,7 +83,6 @@ def test_non_utf8_filename_round_trips_to_git_and_is_safely_rendered(
         base,
         max_files=10,
         chunk_bytes=20_000,
-        chunk_files=4,
     )
     assert len(manifest) == 1
     assert "\\udcff" in manifest[0]

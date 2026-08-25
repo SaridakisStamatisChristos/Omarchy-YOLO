@@ -512,24 +512,35 @@ def test_recovery_state_matrix_closes_attempts_without_regressing_completed_task
                 ],
             )
             task_state = active_states[index % len(active_states)]
-            db.update_job(job.id, state=job_state, stop_requested=stop_requested)
-            db.update_task(inflight.id, state=TaskState.RUNNING, attempts=1)
-            if task_state in {TaskState.REVIEWING, TaskState.INTEGRATING}:
-                db.update_task(inflight.id, state=TaskState.REVIEWING)
-            if task_state == TaskState.INTEGRATING:
-                db.update_task(inflight.id, state=TaskState.INTEGRATING)
-            db.update_task(completed.id, state=TaskState.RUNNING)
-            db.update_task(completed.id, state=TaskState.REVIEWING)
-            db.update_task(completed.id, state=TaskState.INTEGRATING)
-            db.update_task(completed.id, state=TaskState.COMPLETED)
-            db.start_attempt(
-                job_id=job.id,
-                task_id=inflight.id,
-                number=1,
-                agent="fault-injected",
-                worktree="/tmp/worktree",
-                branch="yolo/task",
-                log_path="/tmp/attempt.log",
+            # This matrix intentionally models crash-time durable snapshots that
+            # the guarded public mutation API now refuses to manufacture. Seed
+            # them directly, then verify recovery closes every running attempt
+            # without regressing a task that had already completed.
+            db._execute(
+                "UPDATE jobs SET state = ?, stop_requested = ? WHERE id = ?",
+                (job_state.value, int(stop_requested), job.id),
+            )
+            db._execute(
+                "UPDATE tasks SET state = ?, attempts = 1 WHERE id = ?",
+                (task_state.value, inflight.id),
+            )
+            db._execute(
+                "UPDATE tasks SET state = ? WHERE id = ?",
+                (TaskState.COMPLETED.value, completed.id),
+            )
+            db._execute(
+                """
+                INSERT INTO attempts(
+                  id, job_id, task_id, number, agent, state, worktree, branch,
+                  log_path, started_at
+                ) VALUES (?, ?, ?, 1, 'fault-injected', 'running',
+                          '/tmp/worktree', 'yolo/task', '/tmp/attempt.log', 0)
+                """,
+                (
+                    f"attempt_recovery_{index}_{int(stop_requested)}",
+                    job.id,
+                    inflight.id,
+                ),
             )
             cases.append((job.id, not stop_requested and job_state != JobState.STOPPING))
             if not stop_requested and job_state != JobState.STOPPING:
@@ -577,6 +588,8 @@ def test_status_recent_events_and_attempt_telemetry_ignore_interleaved_event_ids
     task = daemon.db.add_tasks(
         first.id, [PlannedTask("T1", "Telemetry", "Measure attempt")]
     )[0]
+    daemon.db.update_job(first.id, state=JobState.RUNNING)
+    daemon.db.update_task(task.id, state=TaskState.RUNNING, attempts=1)
     attempt = daemon.db.start_attempt(
         job_id=first.id,
         task_id=task.id,
@@ -640,20 +653,28 @@ async def test_cancelled_auto_apply_cannot_leave_applied_source_requeued(
         )
         return "accepted release"
 
-    original_apply = GitRepo.fast_forward_source
+    original_apply = GitRepo.reconcile_fast_forward_source
 
     def delayed_apply(
         repo_arg: GitRepo,
         integration_branch: str,
         base_branch: str,
         base_commit: str,
-    ) -> None:
-        original_apply(repo_arg, integration_branch, base_branch, base_commit)
+        accepted_commit: str,
+    ) -> tuple[str, str]:
+        outcome = original_apply(
+            repo_arg,
+            integration_branch,
+            base_branch,
+            base_commit,
+            accepted_commit,
+        )
         source_applied.set()
         assert release_apply.wait(timeout=5)
+        return outcome
 
     monkeypatch.setattr(orchestrator, "_finalize", finalize)
-    monkeypatch.setattr(GitRepo, "fast_forward_source", delayed_apply)
+    monkeypatch.setattr(GitRepo, "reconcile_fast_forward_source", delayed_apply)
     monkeypatch.setattr("omarchy_yolo.orchestrator.notify", lambda *_: None)
     handle = asyncio.create_task(orchestrator.run_job(job.id))
     assert await asyncio.to_thread(source_applied.wait, 5)
@@ -1360,7 +1381,6 @@ def test_hostile_filenames_have_injective_single_line_review_labels(
         base,
         max_files=10,
         chunk_bytes=20_000,
-        chunk_files=2,
     )
     assert len(manifest) == 3
     assert len(set(manifest)) == 3
@@ -1380,7 +1400,7 @@ def test_release_surfaces_and_quickshell_telemetry_are_synchronized() -> None:
     panel = (root / "shell-plugin/Panel.qml").read_text()
     service = (root / "systemd/omarchy-yolo.service").read_text()
 
-    assert __version__ == project["project"]["version"] == manifest["version"] == "1.4.1"
+    assert __version__ == project["project"]["version"] == manifest["version"] == "1.4.2"
     assert 'echo "Installed Omarchy YOLO $VERSION"' in install
     assert project["tool"]["coverage"]["report"]["fail_under"] == 76
     for field in (

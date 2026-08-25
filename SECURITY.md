@@ -27,7 +27,9 @@ With the Bubblewrap backend, planner/reviewer processes see HOME and the reposit
 layer. Worker mode may receive explicitly configured writable HOME subpaths. Gate mode keeps repository cwd
 writable for build artifacts while host filesystem/HOME are read-only and networking follows policy.
 
-`sandbox.hostile_repo_mode` requires Bubblewrap and strengthens every child profile. HOME, `XDG_RUNTIME_DIR`, and
+The recommended `[safety] preset = "hostile-repo"` fails closed unless Bubblewrap, masked/read-only HOME,
+offline review/gates, and neutralized repository Git commands remain effective; `yolo doctor` reports both the
+configured preset and effective posture. Its underlying `sandbox.hostile_repo_mode` strengthens every child profile. HOME, `XDG_RUNTIME_DIR`, and
 `/tmp` are replaced with fresh mounts and inherited environments are reduced to a non-secret baseline plus explicit
 allowlists. Only configured HOME exceptions are re-exposed to agents; gates never receive them and always unshare
 networking. `git.allow_repository_commands=false` neutralizes repository-configured clean/smudge/process filters

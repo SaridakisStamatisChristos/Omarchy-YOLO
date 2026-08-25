@@ -78,6 +78,7 @@ INFLIGHT_TASK_STATES = frozenset(
     {TaskState.RUNNING, TaskState.REVIEWING, TaskState.INTEGRATING}
 )
 TERMINAL_JOB_STATES = frozenset({JobState.STOPPED, JobState.COMPLETED, JobState.FAILED})
+ACCEPTANCE_PHASES = frozenset({"none", "accepted", "applying", "published"})
 
 
 def validate_job_transition(current: JobState | str, target: JobState | str) -> None:
@@ -114,16 +115,24 @@ def validate_job_snapshot(
     task_states: Iterable[TaskState | str],
     *,
     stop_requested: bool,
+    running_attempt_task_states: Iterable[TaskState | str] = (),
+    acceptance_phase: str | None = None,
 ) -> None:
-    """Validate cross-record invariants at externally meaningful boundaries.
+    """Validate the durable orchestration graph at externally meaningful boundaries.
 
-    This is intentionally stricter than transition validation and is used by tests,
-    recovery checks, and provenance generation. Intermediate statements inside one
-    SQLite transaction do not need to satisfy it until that transaction commits.
+    ``running_attempt_task_states`` contains the current owning-task state for every
+    attempt that is still durably RUNNING. Supplying it lets persistence mutations
+    prove attempt/task/job consistency, not merely the job/task projection.
+
+    ``acceptance_phase`` is optional for compatibility with model-only callers. The
+    durable database always supplies it and therefore also proves that an accepted
+    candidate cannot regress into ordinary scheduling and that COMPLETED implies a
+    published acceptance record.
     """
 
     state = JobState(job_state)
     tasks = tuple(TaskState(item) for item in task_states)
+    running_owners = tuple(TaskState(item) for item in running_attempt_task_states)
     inflight = any(item in INFLIGHT_TASK_STATES for item in tasks)
 
     if state == JobState.COMPLETED and any(item != TaskState.COMPLETED for item in tasks):
@@ -134,3 +143,41 @@ def validate_job_snapshot(
         raise StateTransitionError("stopped job must preserve stop_requested")
     if state == JobState.COMPLETED and stop_requested:
         raise StateTransitionError("completed job cannot retain stop_requested")
+
+    if running_owners:
+        if state not in {JobState.RUNNING, JobState.STOPPING}:
+            raise StateTransitionError(
+                f"{state.value} job cannot retain a running attempt"
+            )
+        if any(owner not in INFLIGHT_TASK_STATES for owner in running_owners):
+            raise StateTransitionError(
+                "running attempt belongs to a task that is not in flight"
+            )
+
+    if acceptance_phase is None:
+        return
+    phase = str(acceptance_phase)
+    if phase not in ACCEPTANCE_PHASES:
+        raise StateTransitionError(f"unknown acceptance phase: {phase}")
+
+    if phase in {"accepted", "applying", "published"}:
+        if any(item != TaskState.COMPLETED for item in tasks):
+            raise StateTransitionError(
+                f"acceptance phase {phase} contains a non-completed task"
+            )
+        if running_owners:
+            raise StateTransitionError(
+                f"acceptance phase {phase} cannot retain a running attempt"
+            )
+
+    if phase in {"accepted", "applying"} and state not in {
+        JobState.RUNNING,
+        JobState.STOPPING,
+    }:
+        raise StateTransitionError(
+            f"acceptance phase {phase} requires running or stopping job state"
+        )
+    if phase == "published" and state != JobState.COMPLETED:
+        raise StateTransitionError("published acceptance requires completed job state")
+    if state == JobState.COMPLETED and phase != "published":
+        raise StateTransitionError("completed job requires published acceptance phase")

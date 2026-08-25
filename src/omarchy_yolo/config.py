@@ -28,7 +28,6 @@ class EngineConfig:
     cleanup_worktrees: bool = True
     execution_profile: str = "yolo-worktree"
     final_review_chunk_bytes: int = 60_000
-    final_review_chunk_files: int = 8
     final_review_max_files: int = 512
     final_review_allow_binary: bool = False
 
@@ -53,11 +52,25 @@ class GateConfig:
 class SandboxConfig:
     backend: str = "native"
     network: bool = True
+    review_network: bool | None = None
+    gate_network: bool | None = None
     read_only_home: bool = False
     writable_home_paths: tuple[str, ...] = ()
     hostile_repo_mode: bool = False
     gate_env_allowlist: tuple[str, ...] = ()
     agent_env_allowlist: tuple[str, ...] = ()
+
+    def network_for(self, execution_profile: str) -> bool:
+        if execution_profile == "review" and self.review_network is not None:
+            return self.review_network
+        if execution_profile == "gate":
+            if self.gate_network is not None:
+                return self.gate_network
+            # Preserve the v1.3 hostile-repository invariant even when callers
+            # construct SandboxConfig directly instead of selecting a named preset.
+            if self.hostile_repo_mode:
+                return False
+        return self.network
 
 
 @dataclass(slots=True)
@@ -79,6 +92,7 @@ _BRANCH_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$")
 _AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AGENT_ROLES = frozenset({"worker", "planner", "reviewer", "integrator"})
+_SAFETY_PRESETS = frozenset({"trusted-local", "hostile-repo", "custom"})
 
 
 @dataclass(slots=True)
@@ -91,14 +105,37 @@ class Config:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     resources: ResourcePolicy = field(default_factory=ResourcePolicy)
     agents: dict[str, AgentConfig] = field(default_factory=dict)
+    safety_preset: str = "trusted-local"
 
     def __post_init__(self) -> None:
+        if self.safety_preset not in _SAFETY_PRESETS:
+            raise YoloError(
+                f"safety preset must be one of {sorted(_SAFETY_PRESETS)}"
+            )
         if self.sandbox.hostile_repo_mode and self.sandbox.backend != "bwrap":
             raise YoloError("sandbox.hostile_repo_mode requires sandbox.backend='bwrap'")
         if self.sandbox.hostile_repo_mode and self.git.allow_repository_commands:
             raise YoloError(
                 "sandbox.hostile_repo_mode requires git.allow_repository_commands=false"
             )
+        if self.safety_preset == "hostile-repo":
+            violations: list[str] = []
+            if self.sandbox.backend != "bwrap":
+                violations.append("sandbox.backend=bwrap")
+            if not self.sandbox.hostile_repo_mode:
+                violations.append("sandbox.hostile_repo_mode=true")
+            if not self.sandbox.read_only_home:
+                violations.append("sandbox.read_only_home=true")
+            if self.sandbox.network_for("review"):
+                violations.append("sandbox.review_network=false")
+            if self.sandbox.network_for("gate"):
+                violations.append("sandbox.gate_network=false")
+            if self.git.allow_repository_commands:
+                violations.append("git.allow_repository_commands=false")
+            if violations:
+                raise YoloError(
+                    "safety preset 'hostile-repo' requires: " + ", ".join(violations)
+                )
 
     @property
     def db_path(self) -> Path:
@@ -111,6 +148,34 @@ class Config:
     @property
     def logs_dir(self) -> Path:
         return self.state_dir / "logs"
+
+    def trust_posture(self) -> tuple[str, str]:
+        hostile = (
+            self.sandbox.backend == "bwrap"
+            and self.sandbox.hostile_repo_mode
+            and self.sandbox.read_only_home
+            and not self.sandbox.network_for("review")
+            and not self.sandbox.network_for("gate")
+            and not self.git.allow_repository_commands
+        )
+        if hostile:
+            return (
+                "hostile-repo",
+                "bwrap; masked HOME/runtime; filtered env; gate/review network off; repository commands neutralized",
+            )
+        if (
+            self.sandbox.backend in {"native", "none"}
+            and not self.sandbox.hostile_repo_mode
+            and self.git.allow_repository_commands
+        ):
+            return (
+                "trusted-local",
+                "trusted repositories only; native execution is not a hostile-code security boundary",
+            )
+        return (
+            "custom",
+            "custom isolation policy; inspect sandbox/network/Git settings before running untrusted code",
+        )
 
 
 def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
@@ -137,6 +202,14 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int, name: 
 def _strict_bool(value: Any, *, default: bool, name: str) -> bool:
     if value is None:
         return default
+    if not isinstance(value, bool):
+        raise YoloError(f"{name} must be true or false")
+    return value
+
+
+def _optional_bool(value: Any, *, name: str) -> bool | None:
+    if value is None:
+        return None
     if not isinstance(value, bool):
         raise YoloError(f"{name} must be true or false")
     return value
@@ -222,6 +295,14 @@ def _agent_roles(value: Any, *, field_name: str) -> tuple[str, ...]:
     return tuple(clean)
 
 
+def _safety_preset(data: dict[str, Any]) -> str:
+    section = _section(data, "safety")
+    preset = str(section.get("preset", "trusted-local")).strip().lower()
+    if preset not in _SAFETY_PRESETS:
+        raise YoloError(f"safety.preset must be one of {sorted(_SAFETY_PRESETS)}")
+    return preset
+
+
 def load_config(path: Path | None = None) -> Config:
     config_path = path or Path(
         os.environ.get("OMARCHY_YOLO_CONFIG", xdg_config_home() / "omarchy-yolo/config.toml")
@@ -234,8 +315,13 @@ def load_config(path: Path | None = None) -> Config:
     state_dir = Path(
         os.environ.get("OMARCHY_YOLO_STATE_DIR", xdg_state_home() / "omarchy-yolo")
     ).expanduser()
+    safety_preset = _safety_preset(data)
 
     e = _section(data, "engine")
+    if "final_review_chunk_files" in e:
+        raise YoloError(
+            "engine.final_review_chunk_files was removed in v1.4.2; raw review shards are intentionally file-local"
+        )
     execution_profile = str(e.get("execution_profile", "yolo-worktree"))
     if execution_profile not in {"yolo-worktree", "danger-yolo"}:
         raise YoloError("engine.execution_profile must be 'yolo-worktree' or 'danger-yolo'")
@@ -255,22 +341,43 @@ def load_config(path: Path | None = None) -> Config:
         cleanup_worktrees=_strict_bool(e.get("cleanup_worktrees"), default=True, name="engine.cleanup_worktrees"),
         execution_profile=execution_profile,
         final_review_chunk_bytes=_bounded_int(e.get("final_review_chunk_bytes", 60_000), default=60_000, minimum=8_000, maximum=120_000, name="engine.final_review_chunk_bytes"),
-        final_review_chunk_files=_bounded_int(e.get("final_review_chunk_files", 8), default=8, minimum=1, maximum=64, name="engine.final_review_chunk_files"),
         final_review_max_files=_bounded_int(e.get("final_review_max_files", 512), default=512, minimum=1, maximum=4096, name="engine.final_review_max_files"),
         final_review_allow_binary=_strict_bool(e.get("final_review_allow_binary"), default=False, name="engine.final_review_allow_binary"),
     )
 
     s = _section(data, "sandbox")
-    backend = str(s.get("backend", "native"))
+    hostile_preset = safety_preset == "hostile-repo"
+    if hostile_preset:
+        if "backend" in s and str(s["backend"]) != "bwrap":
+            raise YoloError(
+                "safety.preset='hostile-repo' conflicts with sandbox.backend"
+            )
+        for key in ("hostile_repo_mode", "read_only_home"):
+            if key in s and s[key] is not True:
+                raise YoloError(
+                    f"safety.preset='hostile-repo' conflicts with sandbox.{key}"
+                )
+        for key in ("review_network", "gate_network"):
+            if key in s and s[key] is not False:
+                raise YoloError(
+                    f"safety.preset='hostile-repo' conflicts with sandbox.{key}"
+                )
+    backend = str(s.get("backend", "bwrap" if hostile_preset else "native"))
     if backend not in {"native", "none", "bwrap"}:
         raise YoloError("sandbox.backend must be 'native', 'none', or 'bwrap'")
-    hostile_repo_mode = _strict_bool(s.get("hostile_repo_mode"), default=False, name="sandbox.hostile_repo_mode")
+    hostile_repo_mode = _strict_bool(
+        s.get("hostile_repo_mode"),
+        default=hostile_preset,
+        name="sandbox.hostile_repo_mode",
+    )
     if hostile_repo_mode and backend != "bwrap":
         raise YoloError("sandbox.hostile_repo_mode requires sandbox.backend='bwrap'")
     sandbox = SandboxConfig(
         backend=backend,
         network=_strict_bool(s.get("network"), default=True, name="sandbox.network"),
-        read_only_home=_strict_bool(s.get("read_only_home"), default=False, name="sandbox.read_only_home"),
+        review_network=(False if hostile_preset and "review_network" not in s else _optional_bool(s.get("review_network"), name="sandbox.review_network")),
+        gate_network=(False if hostile_preset and "gate_network" not in s else _optional_bool(s.get("gate_network"), name="sandbox.gate_network")),
+        read_only_home=_strict_bool(s.get("read_only_home"), default=hostile_preset, name="sandbox.read_only_home"),
         writable_home_paths=_writable_home_paths(s.get("writable_home_paths")),
         hostile_repo_mode=hostile_repo_mode,
         gate_env_allowlist=_environment_names(s.get("gate_env_allowlist"), field_name="sandbox.gate_env_allowlist"),
@@ -278,7 +385,15 @@ def load_config(path: Path | None = None) -> Config:
     )
 
     g = _section(data, "git")
-    allow_repository_commands = _strict_bool(g.get("allow_repository_commands"), default=not hostile_repo_mode, name="git.allow_repository_commands")
+    if hostile_preset and g.get("allow_repository_commands") is True:
+        raise YoloError(
+            "safety.preset='hostile-repo' conflicts with git.allow_repository_commands=true"
+        )
+    allow_repository_commands = _strict_bool(
+        g.get("allow_repository_commands"),
+        default=not hostile_repo_mode,
+        name="git.allow_repository_commands",
+    )
     if hostile_repo_mode and allow_repository_commands:
         raise YoloError("sandbox.hostile_repo_mode requires git.allow_repository_commands=false")
     git = GitConfig(
@@ -345,4 +460,5 @@ def load_config(path: Path | None = None) -> Config:
         sandbox=sandbox,
         resources=resources,
         agents=agents,
+        safety_preset=safety_preset,
     )

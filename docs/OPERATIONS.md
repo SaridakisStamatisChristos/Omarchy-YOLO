@@ -70,7 +70,6 @@ The release audit is hierarchical. Every changed file must fit the configured re
 ```toml
 [engine]
 final_review_chunk_bytes = 60000
-final_review_chunk_files = 8
 final_review_max_files = 512
 ```
 
@@ -109,23 +108,21 @@ available implementation.
 For repositories whose tracked code and gate commands are hostile, install Bubblewrap and use:
 
 ```toml
+[safety]
+preset = "hostile-repo"
+
 [sandbox]
-backend = "bwrap"
-hostile_repo_mode = true
 network = false
 gate_env_allowlist = []
 agent_env_allowlist = []
 writable_home_paths = []
-
-[git]
-allow_repository_commands = false
-command_timeout_seconds = 120
 ```
 
 All child profiles receive fresh HOME, `XDG_RUNTIME_DIR`, and `/tmp` mounts plus filtered environments. Paths in
 `writable_home_paths` are the only host HOME content re-exposed: workers/integrators receive writable binds and
 planners/reviewers receive read-only binds. Gates receive no HOME exceptions, retain write access to the candidate
-repository, and always run without network. Agent network still follows `sandbox.network` for remote model CLIs.
+repository, and always run without network. Review network is also disabled by the preset; worker/integrator network
+still follows `sandbox.network` for remote model CLIs.
 Use `agent_env_allowlist` and `gate_env_allowlist` sparingly: any listed secret is readable by the corresponding
 untrusted process. Orchestrator Git also disables repository-configured clean/smudge/process filters and custom
 merge drivers.
