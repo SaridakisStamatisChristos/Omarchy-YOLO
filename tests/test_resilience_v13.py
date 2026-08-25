@@ -1400,7 +1400,7 @@ def test_release_surfaces_and_quickshell_telemetry_are_synchronized() -> None:
     panel = (root / "shell-plugin/Panel.qml").read_text()
     service = (root / "systemd/omarchy-yolo.service").read_text()
 
-    assert __version__ == project["project"]["version"] == manifest["version"] == "1.4.1"
+    assert __version__ == project["project"]["version"] == manifest["version"] == "1.4.2"
     assert 'echo "Installed Omarchy YOLO $VERSION"' in install
     assert project["tool"]["coverage"]["report"]["fail_under"] == 76
     for field in (

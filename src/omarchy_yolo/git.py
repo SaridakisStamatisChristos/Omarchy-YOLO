@@ -700,6 +700,24 @@ class GitRepo:
         current_head = self.head()
         if current_head == accepted_commit:
             return "applied", "source already at accepted commit"
+        contains_accepted = self.run(
+            "merge-base",
+            "--is-ancestor",
+            accepted_commit,
+            current_head,
+            check=False,
+        )
+        if contains_accepted.timed_out:
+            raise GitError("timed out while checking accepted source ancestry")
+        if contains_accepted.output_truncated:
+            raise GitError("accepted source ancestry check produced oversized output")
+        if contains_accepted.returncode == 0:
+            return "applied", "source already contains accepted commit"
+        if contains_accepted.returncode != 1:
+            raise GitError(
+                "cannot check accepted source ancestry: "
+                f"{contains_accepted.stderr.strip()}"
+            )
         if current_head != base_commit:
             return "skipped", "source branch moved since job creation"
 
@@ -709,7 +727,7 @@ class GitRepo:
             "merge",
             "--ff-only",
             "--",
-            integration_branch,
+            accepted_commit,
         )
         final_head = self.head()
         if final_head != accepted_commit:

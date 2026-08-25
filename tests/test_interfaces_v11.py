@@ -475,3 +475,4 @@ async def test_cli_doctor_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert await cli.cmd_doctor(argparse.Namespace()) == 0
     output = capsys.readouterr().out
     assert "agent-ready" in output and "daemon" in output
+    assert "trust-posture" in output and "effective=trusted-local" in output

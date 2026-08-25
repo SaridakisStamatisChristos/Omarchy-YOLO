@@ -5,11 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from omarchy_yolo.config import GitConfig
+from omarchy_yolo.config import Config, GitConfig, load_config
 from omarchy_yolo.db import Database
-from omarchy_yolo.git import GitRepo
+from omarchy_yolo.git import CommandOutput, GitError, GitRepo
 from omarchy_yolo.model import JobState, PlannedTask, TaskState
+from omarchy_yolo.orchestrator import Orchestrator
 from omarchy_yolo.state_machine import StateTransitionError, validate_job_snapshot
+from omarchy_yolo.util import YoloError
 
 
 def _digest(content: str) -> str:
@@ -338,6 +340,137 @@ def test_provenance_guards_and_idempotent_apply_journal(tmp_path: Path) -> None:
         db.close()
 
 
+def test_attempt_lifecycle_has_one_owner_and_one_terminal_write(tmp_path: Path) -> None:
+    db = Database(tmp_path / "attempt-lifecycle" / "state.sqlite3")
+    try:
+        job = db.create_job(
+            repo=str(tmp_path / "repo-attempt-lifecycle"),
+            goal="close attempt lifecycle",
+            base_branch="main",
+            base_commit="a" * 40,
+            integration_branch="yolo/attempt-lifecycle/integration",
+            auto_apply=False,
+        )
+        task = db.add_tasks(
+            job.id,
+            [PlannedTask("T1", "Attempt", "Prove single ownership")],
+        )[0]
+        db.update_job(job.id, state=JobState.RUNNING)
+        db.update_task(task.id, state=TaskState.RUNNING, attempts=1)
+        attempt = db.start_attempt(
+            job_id=job.id,
+            task_id=task.id,
+            number=1,
+            agent="fake",
+            worktree="/tmp/attempt-1",
+            branch="yolo/attempt-1",
+            log_path="/tmp/attempt-1.log",
+        )
+
+        with pytest.raises(StateTransitionError, match="terminal attempt state"):
+            db.finish_attempt(attempt, state="running", returncode=None, summary="not done")
+        with pytest.raises(StateTransitionError, match="already has running attempt"):
+            db.start_attempt(
+                job_id=job.id,
+                task_id=task.id,
+                number=2,
+                agent="fake",
+                worktree="/tmp/attempt-2",
+                branch="yolo/attempt-2",
+                log_path="/tmp/attempt-2.log",
+            )
+
+        db.finish_attempt(attempt, state="passed", returncode=0, summary="accepted")
+        with pytest.raises(StateTransitionError, match="already finished"):
+            db.finish_attempt(attempt, state="failed", returncode=1, summary="rewrite")
+    finally:
+        db.close()
+
+
+def test_accepted_job_metadata_is_frozen_but_stop_race_remains_modeled(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "accepted-immutability" / "state.sqlite3")
+    try:
+        job_id, _ = _completed_candidate(db, tmp_path, suffix="accepted-immutability")
+        _prepare_acceptance(db, job_id)
+
+        with pytest.raises(StateTransitionError, match="metadata is immutable"):
+            db.update_job(job_id, final_summary="rewritten after acceptance")
+        with pytest.raises(StateTransitionError, match="metadata is immutable"):
+            db.update_job(job_id, integration_path="/tmp/replaced")
+
+        db.update_job(job_id, state=JobState.STOPPING, stop_requested=True)
+        accepted = db.get_job(job_id)
+        assert accepted.state == JobState.STOPPING
+        assert accepted.stop_requested
+        assert accepted.final_summary == "accepted"
+    finally:
+        db.close()
+
+
+async def test_staged_dossier_is_verified_before_source_application(tmp_path: Path) -> None:
+    class ApplyProbe:
+        def __init__(self, root: Path):
+            self.root = root
+            self.called = False
+
+        def reconcile_fast_forward_source(self, *_args: str) -> tuple[str, str]:
+            self.called = True
+            return "applied", "must not run"
+
+    cfg = Config(
+        state_dir=tmp_path / "dossier-integrity" / "state",
+        config_path=tmp_path / "dossier-integrity" / "config.toml",
+    )
+    db = Database(cfg.db_path)
+    try:
+        job_id, _ = _completed_candidate(
+            db,
+            tmp_path,
+            suffix="dossier-integrity",
+            auto_apply=True,
+        )
+        _prepare_acceptance(db, job_id, intent="requested")
+        db._execute(
+            "UPDATE dossiers SET content = ? WHERE job_id = ?",
+            ('{"accepted":false}', job_id),
+        )
+        repo_root = tmp_path / "dossier-integrity" / "repo"
+        repo_root.mkdir(parents=True)
+        repo = ApplyProbe(repo_root)
+        orchestrator = Orchestrator(cfg, db)
+
+        with pytest.raises(YoloError, match="SHA-256 verification"):
+            await orchestrator._resume_accepted_job(db.get_job(job_id), repo)  # type: ignore[arg-type]
+
+        assert not repo.called
+        assert db.get_job(job_id).acceptance_phase == "accepted"
+    finally:
+        db.close()
+
+
+def test_hostile_repository_preset_is_coherent_and_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "hostile.toml"
+    path.write_text('[safety]\npreset = "hostile-repo"\n')
+    loaded = load_config(path)
+    assert loaded.safety_preset == "hostile-repo"
+    assert loaded.sandbox.backend == "bwrap"
+    assert loaded.sandbox.hostile_repo_mode
+    assert loaded.sandbox.read_only_home
+    assert loaded.sandbox.network_for("review") is False
+    assert loaded.sandbox.network_for("gate") is False
+    assert loaded.git.allow_repository_commands is False
+    assert loaded.trust_posture()[0] == "hostile-repo"
+
+    conflict = tmp_path / "hostile-conflict.toml"
+    conflict.write_text(
+        '[safety]\npreset = "hostile-repo"\n[sandbox]\nreview_network = true\n'
+    )
+    with pytest.raises(YoloError, match="conflicts with sandbox.review_network"):
+        load_config(conflict)
+
+
 def test_git_reconcile_fast_forward_is_idempotent(
     git_repo: Path,
     tmp_path: Path,
@@ -373,6 +506,18 @@ def test_git_reconcile_fast_forward_is_idempotent(
     assert outcome == "applied"
     assert "already at accepted commit" in reason
 
+    (git_repo / "user-follow-up.txt").write_text("follow-up\n")
+    follow_up = repo.commit_all(git_repo, "user follow-up", GitConfig())
+    outcome, reason = repo.reconcile_fast_forward_source(
+        integration_branch,
+        base_branch,
+        base_commit,
+        accepted_commit,
+    )
+    assert outcome == "applied"
+    assert "already contains accepted commit" in reason
+    assert repo.head() == follow_up
+
     outcome, reason = repo.reconcile_fast_forward_source(
         integration_branch,
         "HEAD",
@@ -381,3 +526,116 @@ def test_git_reconcile_fast_forward_is_idempotent(
     )
     assert outcome == "skipped"
     assert "detached" in reason
+
+
+def test_git_reconcile_merges_journaled_commit_not_racing_branch(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = GitRepo.discover(git_repo)
+    base_branch, base_commit = repo.preflight(require_clean=True)
+    integration_branch = "yolo/v142/racing-ref"
+    integration = tmp_path / "integration-v142-racing-ref"
+    repo.ensure_existing_branch_worktree(integration, integration_branch, base_commit)
+    (integration / "accepted.txt").write_text("accepted\n")
+    accepted_commit = repo.commit_all(integration, "accepted candidate", GitConfig())
+    (integration / "unaccepted.txt").write_text("unaccepted\n")
+    unaccepted_commit = repo.commit_all(integration, "unaccepted descendant", GitConfig())
+    repo.run("reset", "--hard", accepted_commit, cwd=integration)
+
+    original_run = repo.run
+    ref_moved = False
+
+    def racing_run(*args: str, **kwargs: object):
+        nonlocal ref_moved
+        if not ref_moved and "merge" in args and "--ff-only" in args:
+            original_run(
+                "update-ref",
+                f"refs/heads/{integration_branch}",
+                unaccepted_commit,
+                accepted_commit,
+            )
+            ref_moved = True
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "run", racing_run)
+    outcome, _ = repo.reconcile_fast_forward_source(
+        integration_branch,
+        base_branch,
+        base_commit,
+        accepted_commit,
+    )
+
+    assert ref_moved
+    assert outcome == "applied"
+    assert repo.head() == accepted_commit
+
+
+def test_git_reconcile_skips_clean_source_moved_to_sibling(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    repo = GitRepo.discover(git_repo)
+    base_branch, base_commit = repo.preflight(require_clean=True)
+    integration_branch = "yolo/v142/source-sibling"
+    integration = tmp_path / "integration-v142-source-sibling"
+    repo.ensure_existing_branch_worktree(integration, integration_branch, base_commit)
+    (integration / "accepted.txt").write_text("accepted\n")
+    accepted_commit = repo.commit_all(integration, "accepted candidate", GitConfig())
+
+    (git_repo / "user-change.txt").write_text("user change\n")
+    moved_commit = repo.commit_all(git_repo, "user source change", GitConfig())
+    outcome, reason = repo.reconcile_fast_forward_source(
+        integration_branch,
+        base_branch,
+        base_commit,
+        accepted_commit,
+    )
+
+    assert outcome == "skipped"
+    assert "moved since job creation" in reason
+    assert repo.head() == moved_commit
+
+
+@pytest.mark.parametrize(
+    ("ancestry_output", "message"),
+    [
+        (CommandOutput(1, "", "", timed_out=True), "timed out"),
+        (CommandOutput(1, "", "", output_truncated=True), "oversized output"),
+        (CommandOutput(2, "", "fatal: synthetic ancestry failure"), "synthetic ancestry"),
+    ],
+)
+def test_git_reconcile_fails_closed_when_ancestry_cannot_be_proved(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestry_output: CommandOutput,
+    message: str,
+) -> None:
+    repo = GitRepo.discover(git_repo)
+    base_branch, base_commit = repo.preflight(require_clean=True)
+    integration_branch = "yolo/v142/ancestry-error"
+    integration = tmp_path / "integration-v142-ancestry-error"
+    repo.ensure_existing_branch_worktree(integration, integration_branch, base_commit)
+    (integration / "accepted.txt").write_text("accepted\n")
+    accepted_commit = repo.commit_all(integration, "accepted candidate", GitConfig())
+    (git_repo / "user-change.txt").write_text("user change\n")
+    moved_commit = repo.commit_all(git_repo, "user source change", GitConfig())
+
+    original_run = repo.run
+
+    def intercept_run(*args: str, **kwargs: object):
+        if args[:2] == ("merge-base", "--is-ancestor"):
+            return ancestry_output
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "run", intercept_run)
+    with pytest.raises(GitError, match=message):
+        repo.reconcile_fast_forward_source(
+            integration_branch,
+            base_branch,
+            base_commit,
+            accepted_commit,
+        )
+    assert repo.head() == moved_commit

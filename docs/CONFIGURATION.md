@@ -1,6 +1,6 @@
 # Omarchy YOLO Configuration Reference
 
-This document is the authoritative operator-facing reference for Omarchy YOLO v1.4 configuration.
+This document is the authoritative operator-facing reference for Omarchy YOLO v1.4.2 configuration.
 
 The example file is [`config.example.toml`](../config.example.toml). Operational procedures are in [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md), lifecycle behavior is in [HOW_IT_WORKS.md](HOW_IT_WORKS.md), and trust boundaries are in [../SECURITY.md](../SECURITY.md).
 
@@ -54,6 +54,7 @@ yolo doctor
 ## 2. Complete section map
 
 ```toml
+[safety]
 [engine]
 [git]
 [gates]
@@ -68,7 +69,24 @@ yolo doctor
 
 Unknown TOML sections are not part of the supported contract. Use the names documented here.
 
-## 3. `[engine]`
+## 3. `[safety]`
+
+The safety section names the intended trust policy and, for the hostile preset, applies and enforces a coherent set of settings across sandbox, network and Git controls.
+
+### `preset`
+
+```toml
+preset = "trusted-local"
+```
+
+- Allowed: `"trusted-local"`, `"hostile-repo"`, `"custom"`
+- Default: `"trusted-local"`
+
+`trusted-local` preserves the compatibility defaults and is appropriate only when repository contents and configured gates are trusted. `hostile-repo` selects Bubblewrap, hostile repository mode, read-only/masked HOME, offline review and gates, and `git.allow_repository_commands = false`; an explicit conflicting override is rejected. `custom` records that the operator intentionally assembled a policy from the lower-level settings below.
+
+`yolo doctor` reports both this configured label and the effective posture computed from the resulting settings. A configured label never upgrades a weaker effective posture.
+
+## 4. `[engine]`
 
 The engine section controls scheduling, retries, role selection, execution mode, source application, cleanup, and final-review bounds.
 
@@ -254,19 +272,6 @@ final_review_chunk_bytes = 60000
 - Range: `8000..120000`
 - Meaning: byte budget used when splitting large textual file diffs into file-local review shards.
 
-### `final_review_chunk_files`
-
-```toml
-final_review_chunk_files = 8
-```
-
-- Type: integer
-- Default: `8`
-- Range: `1..64`
-- Meaning: bounded file-count parameter used by final review input construction.
-
-Final review remains file-local at the shard level; this setting does not permit one shard to mix unrelated files.
-
 ### `final_review_max_files`
 
 ```toml
@@ -292,7 +297,7 @@ final_review_allow_binary = false
 
 `false` is the high-assurance default. Setting `true` does **not** make binary content semantically reviewed; it intentionally lowers assurance to metadata-only treatment.
 
-## 4. `[git]`
+## 5. `[git]`
 
 The Git section controls repository preconditions, naming, control-plane identity, subprocess bounds, and whether repository-defined command hooks/filters may execute during orchestrator Git operations.
 
@@ -369,7 +374,7 @@ Git repositories may configure clean/smudge/process filters and merge drivers th
 
 When `sandbox.hostile_repo_mode = true`, this option **must** be `false`.
 
-## 5. `[gates]`
+## 6. `[gates]`
 
 Repository gates are deterministic commands that must pass before candidate acceptance.
 
@@ -418,7 +423,7 @@ Gate commands execute through `/bin/bash -lc` in the assigned repository worktre
 
 Do not put secrets directly in gate command strings.
 
-## 6. `[sandbox]`
+## 7. `[sandbox]`
 
 The sandbox section controls outer child-process isolation. It is separate from Git worktree isolation and from cgroup resource governance.
 
@@ -449,6 +454,28 @@ network = true
 - Default: `true`
 
 Controls agent/gate network exposure according to the active Bubblewrap profile. In hostile mode, gates are forced offline even if remote agents need network access.
+
+### `review_network`
+
+```toml
+review_network = false
+```
+
+- Type: optional boolean
+- Default: inherit `sandbox.network`
+
+Overrides network exposure for planning and semantic review profiles. The `hostile-repo` preset sets this to `false` and rejects `true`.
+
+### `gate_network`
+
+```toml
+gate_network = false
+```
+
+- Type: optional boolean
+- Default: inherit `sandbox.network`
+
+Overrides network exposure for deterministic task/final gates. Hostile repository mode keeps gates offline even when this key is omitted; the `hostile-repo` preset sets it to `false` and rejects `true`.
 
 ### `read_only_home`
 
@@ -528,7 +555,7 @@ agent_env_allowlist = []
 
 Remote model CLIs may require provider credentials. Allow only the minimum necessary names. Any allowlisted secret is readable by child code within that profile.
 
-## 7. `[resources]`
+## 8. `[resources]`
 
 Resource governance is independent of filesystem/network isolation.
 
@@ -607,7 +634,7 @@ io_weight = 0
 - Range accepted by configuration: `0..10000`
 - Active cgroups-v2 weight: use `1..10000`.
 
-## 8. `[agents.NAME]`
+## 9. `[agents.NAME]`
 
 Agent adapters are configuration data rather than provider SDK integrations.
 
@@ -722,13 +749,16 @@ yolo doctor
 yolo agents
 ```
 
-## 9. Recommended profiles
+## 10. Recommended profiles
 
 These examples are starting points, not universal resource prescriptions.
 
 ### Trusted local development
 
 ```toml
+[safety]
+preset = "trusted-local"
+
 [engine]
 max_parallel = 4
 max_global_workers = 4
@@ -753,6 +783,9 @@ backend = "none"
 ### Trusted project with Bubblewrap
 
 ```toml
+[safety]
+preset = "custom"
+
 [engine]
 auto_apply = false
 execution_profile = "yolo-worktree"
@@ -770,17 +803,14 @@ backend = "none"
 ### Hostile/untrusted repository
 
 ```toml
+[safety]
+preset = "hostile-repo"
+
 [engine]
 auto_apply = false
 execution_profile = "yolo-worktree"
 
-[git]
-require_clean_repo = true
-allow_repository_commands = false
-
 [sandbox]
-backend = "bwrap"
-hostile_repo_mode = true
 network = false
 writable_home_paths = []
 gate_env_allowlist = []
@@ -802,21 +832,19 @@ Adjust resource limits to the project and machine. A large Rust/C++ build may le
 If a remote model CLI requires networking and one credential variable:
 
 ```toml
+[safety]
+preset = "hostile-repo"
+
 [sandbox]
-backend = "bwrap"
-hostile_repo_mode = true
 network = true
 writable_home_paths = []
 gate_env_allowlist = []
 agent_env_allowlist = ["PROVIDER_API_KEY"]
-
-[git]
-allow_repository_commands = false
 ```
 
-This preserves offline gates while allowing the agent profile to reach its provider. The credential is necessarily readable by that child process, so this is a deliberate trust trade-off.
+This preserves offline review/gates while allowing worker/integrator agent profiles to reach their provider. The credential is necessarily readable by those child processes, so this is a deliberate trust trade-off.
 
-## 10. Configuration interactions that fail closed
+## 11. Configuration interactions that fail closed
 
 The loader rejects important unsafe or nonsensical combinations.
 
@@ -857,7 +885,7 @@ sandbox backend not in {native, none, bwrap}
 
 Unsafe branch prefixes, invalid environment-variable names, invalid agent identifiers, invalid role names, out-of-range integer values, and non-boolean boolean fields are also rejected rather than coerced silently.
 
-## 11. CLI overrides versus configuration
+## 12. CLI overrides versus configuration
 
 For source application, the CLI can override the configured default per job:
 
@@ -870,7 +898,7 @@ If neither is supplied, `engine.auto_apply` controls the submitted job.
 
 Most other runtime behavior is loaded from the daemon's configuration, so restart the service after changing those values.
 
-## 12. Tuning guidance
+## 13. Tuning guidance
 
 ### Parallelism
 
@@ -903,7 +931,7 @@ Prefer the defaults until a real repository exceeds them. The ceilings are secur
 
 Use cgroups when runaway builds or hostile process trees are a concern. Avoid limits so low that normal compilers or test runners fail spuriously.
 
-## 13. Security guidance
+## 14. Security guidance
 
 Configuration cannot turn local agents into a perfect hostile-code sandbox.
 
@@ -925,7 +953,7 @@ execution dossier SHA-256
 
 For genuinely malicious code, use a disposable VM/container in addition to YOLO's local safeguards.
 
-## 14. Validate after editing
+## 15. Validate after editing
 
 After changing configuration:
 
@@ -938,6 +966,6 @@ yolo status
 
 For a security-sensitive change, also inspect the effective behavior with a disposable test repository before entrusting a large unattended job to the new profile.
 
-## 15. Canonical example
+## 16. Canonical example
 
 The repository's complete supported example remains [`config.example.toml`](../config.example.toml). Keep that file and this reference synchronized when adding or changing configuration fields.

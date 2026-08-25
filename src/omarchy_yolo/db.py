@@ -62,12 +62,21 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
-                    "SELECT state, stop_requested FROM jobs WHERE id = ?", (job_id,)
+                    "SELECT state, stop_requested, acceptance_phase FROM jobs WHERE id = ?",
+                    (job_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError(job_id)
                 current = JobState(str(row["state"]))
                 values: dict[str, Any] = dict(fields)
+                acceptance_phase = str(row["acceptance_phase"])
+                mutable_after_acceptance = {"state", "stop_requested"}
+                frozen_fields = set(values) - mutable_after_acceptance
+                if acceptance_phase != "none" and frozen_fields:
+                    raise StateTransitionError(
+                        "accepted job metadata is immutable; refusing fields: "
+                        f"{sorted(frozen_fields)}"
+                    )
                 target = JobState(values.get("state", current))
                 validate_job_transition(current, target)
                 if target == JobState.COMPLETED and current != JobState.COMPLETED:
@@ -221,6 +230,14 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                     raise StateTransitionError(
                         f"attempt cannot start after acceptance begins ({acceptance_phase})"
                     )
+                running = self._conn.execute(
+                    "SELECT id FROM attempts WHERE task_id = ? AND state = 'running' LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if running is not None:
+                    raise StateTransitionError(
+                        f"task {task_id} already has running attempt {running['id']}"
+                    )
                 self._conn.execute(
                     """
                     INSERT INTO attempts(
@@ -266,6 +283,14 @@ class Database(RecordsMixin, RecoveryMixin, ProvenanceMixin):
                 job_id = str(row["job_id"])
                 current = AttemptState(str(row["state"]))
                 target = AttemptState(state)
+                if current != AttemptState.RUNNING:
+                    raise StateTransitionError(
+                        f"attempt {attempt_id} is already finished ({current.value})"
+                    )
+                if target == AttemptState.RUNNING:
+                    raise StateTransitionError(
+                        "finish_attempt requires a terminal attempt state"
+                    )
                 validate_attempt_transition(current, target)
                 cur = self._conn.execute(
                     """

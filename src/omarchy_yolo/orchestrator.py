@@ -13,7 +13,7 @@ from .omarchy import notify
 from .orchestrator_integration import IntegrationMixin
 from .orchestrator_task import TaskExecutionMixin
 from .planner import Planner
-from .provenance import DOSSIER_SCHEMA_VERSION, build_dossier
+from .provenance import DOSSIER_SCHEMA_VERSION, build_dossier, verify_dossier
 from .reviewer import Reviewer
 from .runtime import ResourceCoordinator
 from .sandbox import Sandbox
@@ -235,6 +235,16 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
         dossier = self.db.get_staged_dossier(accepted.id)
         if dossier is None or bool(dossier["published"]):
             raise YoloError("accepted job is missing its unpublished staged dossier")
+        dossier_schema_version = int(dossier["schema_version"])
+        dossier_sha256 = str(dossier["sha256"])
+        dossier_content = str(dossier["content"])
+        if dossier_schema_version != DOSSIER_SCHEMA_VERSION:
+            raise YoloError(
+                "accepted job staged dossier has an unsupported schema version: "
+                f"{dossier_schema_version}"
+            )
+        if not verify_dossier(dossier_content, dossier_sha256):
+            raise YoloError("accepted job staged dossier failed SHA-256 verification")
 
         source_apply_outcome = "not-requested"
         source_apply_reason = ""
@@ -260,8 +270,8 @@ class Orchestrator(TaskExecutionMixin, IntegrationMixin):
 
         self.db.publish_completed_job(
             accepted.id,
-            dossier_schema_version=int(dossier["schema_version"]),
-            dossier_sha256=str(dossier["sha256"]),
+            dossier_schema_version=dossier_schema_version,
+            dossier_sha256=dossier_sha256,
             final_summary=accepted.final_summary,
             source_apply_outcome=source_apply_outcome,
             source_apply_reason=source_apply_reason,

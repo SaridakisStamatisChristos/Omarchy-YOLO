@@ -387,6 +387,9 @@ then verify the `dev.aether.yolo` plugin is enabled in Omarchy.
 A practical trusted-project profile is:
 
 ```toml
+[safety]
+preset = "trusted-local"
+
 [engine]
 execution_profile = "yolo-worktree"
 auto_apply = false
@@ -404,6 +407,9 @@ backend = "none"
 For a stronger local boundary without hostile mode, use Bubblewrap:
 
 ```toml
+[safety]
+preset = "custom"
+
 [sandbox]
 backend = "bwrap"
 network = true
@@ -416,19 +422,17 @@ hostile_repo_mode = false
 For untrusted repository contents or gate commands:
 
 ```toml
+[safety]
+preset = "hostile-repo"
+
 [sandbox]
-backend = "bwrap"
-hostile_repo_mode = true
 network = false
 gate_env_allowlist = []
 agent_env_allowlist = []
 writable_home_paths = []
-
-[git]
-allow_repository_commands = false
 ```
 
-This gives child profiles a fresh HOME/runtime view, private `/tmp`, filtered environments, and offline gates. Control-plane Git neutralizes repository-configured filter/process commands and custom merge drivers.
+This gives child profiles a fresh HOME/runtime view, private `/tmp`, filtered environments, offline review/gates, and neutralized repository-configured filter/process commands and custom merge drivers. `yolo doctor` reports both the configured preset and effective trust posture.
 
 Remote coding CLIs may require network access. If you set `sandbox.network = true` in hostile mode, remember that explicitly allowlisted credentials remain readable by child code. Prefer the smallest possible environment allowlist.
 
